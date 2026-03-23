@@ -1,0 +1,9 @@
+MetaTrader5
+PyQt6
+numpy
+numba
+windows-toasts
+pygame
+ctrader_open_api
+service_identity
+tzdata

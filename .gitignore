@@ -1,0 +1,72 @@
+# ══════════════════════════════════════════════════════════════
+# TAKUMI Trader — .gitignore
+# Only cTrader integration + app skeleton are public.
+# All proprietary trading algorithms are excluded.
+# ══════════════════════════════════════════════════════════════
+
+# ── Proprietary core modules (trading algorithms) ─────────────
+takumi_trader/core/strength.py
+takumi_trader/core/backtester.py
+takumi_trader/core/param_optimizer.py
+takumi_trader/core/exit_engine.py
+takumi_trader/core/filter_engine.py
+takumi_trader/core/htf_regime.py
+takumi_trader/core/tick_flow_tracker.py
+takumi_trader/core/target_calculator.py
+takumi_trader/core/session_range.py
+takumi_trader/core/session_manager.py
+takumi_trader/core/range_engine.py
+takumi_trader/core/trade_tracker.py
+takumi_trader/core/alerts.py
+takumi_trader/core/alert_performance.py
+takumi_trader/core/mt5_worker.py
+takumi_trader/core/dukascopy_downloader.py
+takumi_trader/core/pair_algo_settings.py
+
+# ── Proprietary UI modules ────────────────────────────────────
+takumi_trader/ui/main_window.py
+takumi_trader/ui/backtest_dialog.py
+takumi_trader/ui/pair_algo_dialog.py
+takumi_trader/ui/performance_dialog.py
+takumi_trader/ui/filter_toolbar.py
+takumi_trader/ui/explanation_dialog.py
+
+# ── Data & results ────────────────────────────────────────────
+data/
+*.json
+
+# ── Build artifacts ───────────────────────────────────────────
+dist/
+build/
+*.spec
+*.exe
+BACKUP/
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+
+# ── IDE / OS ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── Resources cleanup ─────────────────────────────────────────
+takumi_trader/resources/OLD/
+
+# ── Misc ──────────────────────────────────────────────────────
+*.log
+crash_log.txt
+_create_shortcut.vbs
+create_settings_doc.py
+test_*.py
+Forex_Scalper_PRO_System_Documentation.docx
+RunTAKUMI.bat
