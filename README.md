@@ -1,4 +1,4 @@
-# Personal Forex Trader: Execution Engine
+# Takumi Trader: Execution Engine
 *A private, AI-assisted trade execution bridge for Windows 11.*
 
 This repository serves as the development hub for a proprietary algorithmic execution engine. The software is designed to bridge local behavioral analysis formulas with a high-performance execution layer.
