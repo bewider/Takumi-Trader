@@ -227,51 +227,89 @@ class M1Cache:
         start_epoch: float,
         end_epoch: float,
     ) -> np.ndarray | None:
-        """Return the requested month's M1 data as ndarray.
+        """Return the requested month's M1 data as ndarray, ensuring the
+        requested [start_epoch, end_epoch] window is covered.
 
-        Order of resolution:
-            1. In-memory parse cache hit -> return ndarray
-            2. Disk parquet hit -> parse, cache, return
-            3. MT5 lazy fill (with 12h padding around the gap) -> parse, cache, return
-            4. MT5 disabled or fetch failed -> return None
+        Coverage-aware (2026-05-07 bugfix): the prior implementation
+        returned in-memory or disk-cached data without checking whether
+        the cached range actually covered the request. With partial
+        coverage (e.g., parquet has 00:00-14:50 UTC but request is
+        15:05 UTC), the caller's slice produced an empty ndarray, the
+        simulator classified it as 'empty_m1', and the worker's retry
+        loop burned 12 cycles before giving up. Found via Phase E
+        diligence check on 2026-05-07; 747 records were pinned at the
+        retry cap with this exact failure shape.
 
-        Empty months (parquet exists but no rows in window) return zero-length array.
+        Resolution order:
+            1. Load existing data (memory cache → disk parquet)
+            2. If no data OR existing data does NOT cover the request,
+               fetch a padded UNION of (existing range, requested range)
+               from MT5, replace cache + parquet, return.
+            3. If MT5 unavailable and existing data partial: return
+               what we have (caller may still get useful slices).
+            4. If MT5 unavailable and no existing data: return None.
+
+        Empty months (parquet exists, request fully covered, no rows
+        in window) still return zero-length array.
         """
         cache_key = (pair, year_month)
-        if cache_key in self._parsed:
-            return self._parsed[cache_key]
 
-        path = self._path_for(pair, year_month)
-        if path.exists():
-            try:
-                arr = self._read_parquet(path)
-                self._parsed[cache_key] = arr
-                return arr
-            except Exception as exc:
-                logger.warning(
-                    "[M1CACHE] failed to read %s: %s — falling back to MT5",
-                    path, exc,
-                )
-                # Fall through to MT5 fill
+        # Step 1: load whatever we have (memory or disk)
+        existing: np.ndarray | None = self._parsed.get(cache_key)
+        if existing is None:
+            path = self._path_for(pair, year_month)
+            if path.exists():
+                try:
+                    existing = self._read_parquet(path)
+                    self._parsed[cache_key] = existing
+                except Exception as exc:
+                    logger.warning(
+                        "[M1CACHE] failed to read %s: %s — falling back to MT5",
+                        path, exc,
+                    )
+                    existing = None
 
+        # Step 2: coverage check
+        if existing is not None and len(existing) > 0:
+            cached_min = int(existing["time"].min())
+            cached_max = int(existing["time"].max())
+            if int(start_epoch) >= cached_min and int(end_epoch) <= cached_max:
+                # Fully covered — fast path
+                return existing
+
+        # Need MT5 to fetch (or extend coverage)
         if self.mt5 is None:
+            if existing is not None:
+                # Partial coverage but no MT5 — return best effort
+                return existing
             logger.warning(
-                "[M1CACHE] miss for %s/%s and mt5 disabled",
-                pair, year_month,
+                "[M1CACHE] miss for %s/%s and mt5 disabled", pair, year_month,
             )
             return None
 
-        # Lazy MT5 fill — fetch a padded window so future requests within
-        # the same range hit cache. Pad the requested span by 12h on each
-        # side, but clip to the calendar month boundary so we don't pull
-        # data that belongs in a neighboring file.
+        # Compute the fetch window: union of existing range and requested
+        # range, padded by 12h each side, clipped to the calendar month.
+        # Fetching the union (rather than just the missing portion) keeps
+        # the parquet write atomic and avoids merge-dedupe complexity.
+        if existing is not None and len(existing) > 0:
+            union_start = min(int(existing["time"].min()), int(start_epoch))
+            union_end = max(int(existing["time"].max()), int(end_epoch))
+        else:
+            union_start = int(start_epoch)
+            union_end = int(end_epoch)
+
         fetch_start, fetch_end = self._compute_fetch_window(
-            year_month, start_epoch, end_epoch,
+            year_month, union_start, union_end,
         )
         df = self._fetch_from_mt5(pair, fetch_start, fetch_end)
         if df is None:
-            return None
+            # MT5 fetch failed. If we had partial cached data, serve it
+            # rather than returning None — the caller may still get a
+            # useful slice if the request happens to overlap.
+            return existing
 
+        # Replace cache atomically
+        path = self._path_for(pair, year_month)
         try:
             self._write_parquet(path, df)
         except Exception as exc:
