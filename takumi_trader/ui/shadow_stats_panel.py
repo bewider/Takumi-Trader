@@ -5,9 +5,9 @@ infrastructure (Phases A–D) so the operator can see capture rates,
 gate distribution, recent calibrations, and worker health without
 grepping logs or reading JSON files.
 
-E.1 ships sections 1 + 4 only:
-    Section 1: Today's capture summary (counts + filter value-add)
-E.2 will add sections 2 (gate distribution) + 3 (recent calibrations).
+E.1 shipped Section 1 (Today's Capture).
+E.2 adds Section 2 (Today's Gate Distribution) + Section 3 (Recent
+    Calibrations with rolling-10 mean activation at n=10).
 E.3 will add section 4 (worker health + heartbeat).
 E.4 integrates the panel into PerformanceDialog's Sv2 tab.
 
@@ -50,6 +50,38 @@ def today_start_utc() -> float:
     """
     now = time.time()
     return now - (now % 86400.0)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Gate distribution colors — stable per-gate so the bar chart's visual
+# identity is recognizable across refreshes. Chosen for distinctness
+# at small bar sizes; not part of any external contract.
+# ─────────────────────────────────────────────────────────────────────
+
+_GATE_COLORS: dict[str, str] = {
+    "strength_engine":   "#9e9e9e",  # grey  — captured but excluded from "filter" view
+    "divergence_spread": "#1976d2",  # blue
+    "structural":        "#f57c00",  # orange
+    "h1_sweep":          "#7b1fa2",  # purple
+    "conviction":        "#388e3c",  # green
+    "no_trade_window":   "#5d4037",  # brown
+    "duplicate":         "#0097a7",  # teal
+    "adr":               "#c2185b",  # pink
+    "news":              "#fbc02d",  # yellow
+    "internal":          "#616161",  # dark grey
+}
+_GATE_COLOR_DEFAULT = "#9c27b0"      # any unknown gate => violet
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Calibration interpretation — matches the architect's framework
+# stored in project_shadow_calibration_interpretation.md.
+# ─────────────────────────────────────────────────────────────────────
+
+_CAL_BAND_PIPS = 1.5            # drift detector warns at ±this
+_CAL_BORDERLINE_PIPS = 3.0      # |delta| > this is "borderline" per architect
+_CAL_ALARM_PIPS = 15.0          # |delta| > this is "investigate" per architect
+_ROLLING_WINDOW = 10            # drift detector activation threshold
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -127,9 +159,13 @@ class ShadowStatsPanel(QWidget):
         self._capture_section = self._build_capture_section()
         layout.addWidget(self._capture_section)
 
-        # E.2 will add: gate distribution, recent calibrations
+        self._gate_section = self._build_gate_section()
+        layout.addWidget(self._gate_section)
+
+        self._calibration_section = self._build_calibration_section()
+        layout.addWidget(self._calibration_section)
+
         # E.3 will add: worker health
-        # Placeholder spacer for future sections
         layout.addStretch(1)
 
     def _build_capture_section(self) -> QFrame:
@@ -164,6 +200,64 @@ class ShadowStatsPanel(QWidget):
         v.addWidget(self._capture_body)
         return frame
 
+    def _build_gate_section(self) -> QFrame:
+        """Section 2: Today's gate distribution (horizontal bar chart)."""
+        frame = QFrame()
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        frame.setStyleSheet(
+            "QFrame { background: #f7f7f7; border: 1px solid #ddd; "
+            "border-radius: 4px; padding: 4px; }"
+        )
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(6, 4, 6, 4)
+        v.setSpacing(2)
+
+        header = QLabel("─── Today's Gate Distribution ───")
+        header.setStyleSheet("font-weight: bold; color: #444;")
+        v.addWidget(header)
+
+        self._gate_body = QLabel("(loading…)")
+        self._gate_body.setTextFormat(Qt.TextFormat.RichText)
+        self._gate_body.setStyleSheet(
+            "font-family: 'Consolas', 'Courier New', monospace; "
+            "font-size: 10pt; color: #222;"
+        )
+        self._gate_body.setWordWrap(True)
+        v.addWidget(self._gate_body)
+        return frame
+
+    def _build_calibration_section(self) -> QFrame:
+        """Section 3: Recent calibrations + rolling-10 mean activation
+        at n=10. The frame's stylesheet header is mutated by the drift
+        warning slot when the rolling mean leaves the safe band."""
+        frame = QFrame()
+        frame.setObjectName("calibration_section")
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self._calibration_frame_default_style = (
+            "QFrame#calibration_section { background: #f7f7f7; "
+            "border: 1px solid #ddd; border-radius: 4px; padding: 4px; }"
+        )
+        frame.setStyleSheet(self._calibration_frame_default_style)
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(6, 4, 6, 4)
+        v.setSpacing(2)
+
+        self._calibration_header = QLabel(
+            "─── Recent Calibrations ───"
+        )
+        self._calibration_header.setStyleSheet("font-weight: bold; color: #444;")
+        v.addWidget(self._calibration_header)
+
+        self._calibration_body = QLabel("(loading…)")
+        self._calibration_body.setTextFormat(Qt.TextFormat.RichText)
+        self._calibration_body.setStyleSheet(
+            "font-family: 'Consolas', 'Courier New', monospace; "
+            "font-size: 10pt; color: #222;"
+        )
+        self._calibration_body.setWordWrap(True)
+        v.addWidget(self._calibration_body)
+        return frame
+
     # ── Refresh ─────────────────────────────────────────────────────
 
     def refresh(self) -> None:
@@ -180,6 +274,16 @@ class ShadowStatsPanel(QWidget):
         except Exception as exc:
             logger.warning("[SHADOW PANEL] capture section refresh raised: %s", exc)
             self._capture_body.setText("(refresh error — see logs)")
+        try:
+            self._render_gate_section()
+        except Exception as exc:
+            logger.warning("[SHADOW PANEL] gate section refresh raised: %s", exc)
+            self._gate_body.setText("(refresh error — see logs)")
+        try:
+            self._render_calibration_section()
+        except Exception as exc:
+            logger.warning("[SHADOW PANEL] calibration section refresh raised: %s", exc)
+            self._calibration_body.setText("(refresh error — see logs)")
 
     # ── Disk read with mtime caching ────────────────────────────────
 
@@ -409,6 +513,219 @@ class ShadowStatsPanel(QWidget):
             except (TypeError, ValueError):
                 continue
         return out
+
+    # ── Section 2: Today's Gate Distribution ────────────────────────
+
+    def _render_gate_section(self) -> None:
+        """Render today's downstream-filter gate distribution as
+        an HTML horizontal bar chart. Excludes strength_engine
+        (those are already covered in Section 1's reject count)."""
+        if not self._journal_cache:
+            self._gate_body.setText("<i>No data yet.</i>")
+            return
+
+        anchor = today_start_utc()
+        # Only include downstream gates (not strength_engine, not unblocked)
+        counts: dict[str, int] = {}
+        for r in self._journal_cache:
+            if not isinstance(r, dict):
+                continue
+            if float(r.get("signal_time", 0.0)) < anchor:
+                continue
+            gate = r.get("block_gate", "")
+            if not gate or gate == "strength_engine":
+                continue
+            counts[gate] = counts.get(gate, 0) + 1
+
+        if not counts:
+            self._gate_body.setText(
+                "<i>No downstream filter rejections today.</i>"
+            )
+            return
+
+        total = sum(counts.values())
+        sorted_pairs = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+
+        # Render rows as label + colored bar + count/percent
+        rows: list[str] = []
+        # Bar width budget — keep it visually compact and proportional
+        # to terminal-style column lengths the operator is used to.
+        max_bar_chars = 32
+        max_count = max(counts.values())
+        for gate, n in sorted_pairs:
+            pct = 100.0 * n / total if total else 0.0
+            color = _GATE_COLORS.get(gate, _GATE_COLOR_DEFAULT)
+            # Bar width proportional to count vs the largest bucket
+            bar_chars = int(round(max_bar_chars * n / max_count)) if max_count else 0
+            bar_chars = max(1, bar_chars)
+            # Render bar as a coloured span with non-breaking blocks
+            bar_html = (
+                f"<span style='background:{color};color:{color};'>"
+                + ("&#9608;" * bar_chars)
+                + "</span>"
+            )
+            label = f"{gate:<20s}"
+            count_part = f"{n:>5} ({pct:>4.1f}%)"
+            rows.append(
+                f"&nbsp;&nbsp;{label.replace(' ', '&nbsp;')} "
+                f"{bar_html} &nbsp;{count_part}"
+            )
+        self._gate_body.setText("<br>".join(rows))
+
+    # ── Section 3: Recent Calibrations ──────────────────────────────
+
+    def _render_calibration_section(self) -> None:
+        """Render the most recent N calibration entries with delta
+        column and arrow notation (real_exit -> sim_exit). When
+        n >= _ROLLING_WINDOW, also render the rolling-window mean
+        and apply a drift banner if it crosses ±_CAL_BAND_PIPS."""
+        cal = self._calibration_cache
+        if not cal:
+            self._calibration_body.setText(
+                "<i>No calibration data yet — first calibration writes "
+                "when an executed trade closes.</i>"
+            )
+            self._reset_calibration_header()
+            return
+
+        # written_at is a monotonic-ish epoch — sort to ensure newest first
+        sorted_cal = sorted(
+            cal,
+            key=lambda r: float(r.get("written_at", 0.0)),
+            reverse=True,
+        )
+        n = len(sorted_cal)
+        recent = sorted_cal[: max(_ROLLING_WINDOW, 5)]
+
+        rows: list[str] = []
+        for entry in recent:
+            rows.append(self._format_calibration_row(entry))
+
+        # Rolling-10 line + drift banner
+        if n < _ROLLING_WINDOW:
+            footer = (
+                f"<br><i>Rolling-{_ROLLING_WINDOW} mean: not yet "
+                f"(n={n}, need {_ROLLING_WINDOW - n} more)</i>"
+            )
+            self._reset_calibration_header()
+        else:
+            window = sorted_cal[:_ROLLING_WINDOW]
+            deltas = [
+                float(r.get("delta_pips", 0.0))
+                for r in window
+                if isinstance(r.get("delta_pips", None), (int, float))
+            ]
+            if not deltas:
+                mean = 0.0
+            else:
+                mean = sum(deltas) / len(deltas)
+            classification = self._classify_rolling_mean(mean)
+            footer = (
+                f"<br><b>Rolling-{_ROLLING_WINDOW} mean: "
+                f"{self._format_pip(mean)}</b> &nbsp;{classification}"
+                f"<br><i>Drift band: ±{_CAL_BAND_PIPS:.1f}p "
+                f"(warns when outside)</i>"
+            )
+            if abs(mean) > _CAL_BAND_PIPS:
+                if mean < 0:
+                    self._set_calibration_banner_dangerous()
+                else:
+                    self._set_calibration_banner_pessimistic()
+            else:
+                self._reset_calibration_header()
+
+        self._calibration_body.setText("<br>".join(rows) + footer)
+
+    def _format_calibration_row(self, entry: dict) -> str:
+        """One-line summary of a calibration entry. Format:
+            PAIR  DIR  Nmin  REAL→SIM  Δ ±N.Np  [classification]
+        """
+        pair = entry.get("pair", "?")
+        direction = entry.get("direction", "?")
+        try:
+            duration = float(entry.get("real_duration_minutes", 0.0))
+        except (TypeError, ValueError):
+            duration = 0.0
+        delta = entry.get("delta_pips", None)
+        try:
+            delta_f = float(delta) if delta is not None else None
+        except (TypeError, ValueError):
+            delta_f = None
+        real_exit = self._short_exit(entry.get("real_exit_reason", ""))
+        sim_exit = self._short_exit(entry.get("sim_exit_reason", ""))
+
+        delta_html = self._format_pip(delta_f)
+        flag = self._classify_single_entry(delta_f)
+
+        # Right-arrow as HTML entity for terminal-y feel
+        arrow = "&rarr;"
+        return (
+            f"&nbsp;&nbsp;{pair:<7s} {direction:<4s} {int(duration):>4d}min "
+            f"{real_exit}{arrow}{sim_exit} &nbsp;"
+            f"&Delta;&nbsp;{delta_html}&nbsp;{flag}"
+        ).replace(" ", "&nbsp;")
+
+    @staticmethod
+    def _short_exit(reason: str) -> str:
+        """Compress exit reasons to 2-4 character tokens for the row."""
+        m = {
+            "tp_hit": "TP", "sl_hit": "SL",
+            "TP": "TP", "SL": "SL", "TIMEOUT": "TO",
+            "FAILED": "FX", "signal_exit": "SX",
+            "weekend_close": "WC",
+        }
+        return m.get(reason, (reason[:4] or "?"))
+
+    @staticmethod
+    def _classify_single_entry(delta: float | None) -> str:
+        """Per-entry visual flag; matches architect's interpretation
+        framework (±3p sane, ±15p+ alarm, dangerous = optimistic
+        direction)."""
+        if delta is None:
+            return ""
+        if delta < -_CAL_BORDERLINE_PIPS:
+            return "<span style='color:#c62828'>&#9888; optimistic</span>"
+        if abs(delta) <= _CAL_BORDERLINE_PIPS:
+            return "<span style='color:#2e7d32'>&#10003;</span>"
+        if abs(delta) >= _CAL_ALARM_PIPS:
+            return "<span style='color:#c62828'>&#9888; alarm</span>"
+        return "<span style='color:#f57c00'>&#9888; borderline</span>"
+
+    @staticmethod
+    def _classify_rolling_mean(mean: float) -> str:
+        if mean < -_CAL_BAND_PIPS:
+            return "<b style='color:#c62828'>TOO OPTIMISTIC — DANGEROUS</b>"
+        if abs(mean) <= _CAL_BAND_PIPS:
+            return "<span style='color:#2e7d32'>within band &#10003;</span>"
+        # 1.5 < mean <= 7 = pessimistic-borderline; 7-12 = SL-first too aggressive;
+        # > 12 = investigate (per project_shadow_calibration_interpretation.md).
+        if mean <= 7.0:
+            return "<span style='color:#f57c00'>over-pessimistic, slippage-tunable</span>"
+        if mean <= 12.0:
+            return "<span style='color:#f57c00'>over-pessimistic, SL-first dominant</span>"
+        return "<b style='color:#c62828'>far over-pessimistic — investigate</b>"
+
+    def _reset_calibration_header(self) -> None:
+        self._calibration_header.setText("─── Recent Calibrations ───")
+        self._calibration_section.setStyleSheet(self._calibration_frame_default_style)
+
+    def _set_calibration_banner_dangerous(self) -> None:
+        self._calibration_header.setText(
+            "─── ⚠ DRIFT WARNING — Calibrations ───"
+        )
+        self._calibration_section.setStyleSheet(
+            "QFrame#calibration_section { background: #ffebee; "
+            "border: 2px solid #c62828; border-radius: 4px; padding: 4px; }"
+        )
+
+    def _set_calibration_banner_pessimistic(self) -> None:
+        self._calibration_header.setText(
+            "─── ⚠ Drift band exceeded (pessimistic) ───"
+        )
+        self._calibration_section.setStyleSheet(
+            "QFrame#calibration_section { background: #fff3e0; "
+            "border: 2px solid #f57c00; border-radius: 4px; padding: 4px; }"
+        )
 
     # ── Formatting helpers ──────────────────────────────────────────
 
