@@ -1,10 +1,21 @@
-"""cTrader Open API connection bridge — Twisted in thread + Qt signals (Stage 2).
+"""cTrader Open API connection bridge — Twisted in thread + Qt signals.
 
-Runs the ctrader_open_api Client inside a Twisted reactor thread.
-Communicates back to the PyQt6 main thread via QMetaObject.invokeMethod.
+Uses the CANONICAL Spotware pattern from OpenApiPy/samples/ConsoleSample:
+- Single Client instance for the entire session (never destroyed)
+- ClientService (Twisted) handles TCP reconnection automatically
+- Default retryPolicy (Twisted exponential backoff, infinite retries)
+- SDK's TcpProtocol sends heartbeats automatically every 20s
+- _on_connected fires on initial connect AND every auto-reconnect → re-auth
+- _on_disconnected just logs — NO manual reconnection code
+- ProtoOAAccountAuthReq is sent automatically after receiving
+  ProtoOAApplicationAuthRes if currentAccountId is set (survives reconnects)
 
-ALL ctrader_open_api / twisted imports are LAZY to avoid crashing the app
-if the packages are broken or unavailable in the frozen exe.
+Do NOT add:
+- Custom retry policies
+- Manual heartbeat loops
+- Watchdog force-reconnects
+- Destroy/recreate Client cycles
+These all fight against ClientService's built-in reconnection.
 """
 
 from __future__ import annotations
@@ -14,7 +25,7 @@ import threading
 import time
 from typing import Any
 
-from PyQt6.QtCore import QMetaObject, QObject, Qt, Q_ARG, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +36,7 @@ _PT_EXECUTION_EVENT = 2126
 _PT_SYMBOLS_LIST_RES = 2115
 _PT_ERROR_RES = 2142
 _PT_RECONCILE_RES = 2125
+_PT_HEARTBEAT = 51
 
 # Reactor state
 _reactor_started = False
@@ -32,7 +44,7 @@ _reactor_lock = threading.Lock()
 
 
 def _ensure_reactor() -> bool:
-    """Start the Twisted reactor in a daemon thread (once). Returns True on success."""
+    """Start the Twisted reactor in a daemon thread (once)."""
     global _reactor_started
     with _reactor_lock:
         if _reactor_started:
@@ -55,7 +67,7 @@ def _ensure_reactor() -> bool:
 
 
 def _load_ctrader_sdk() -> bool:
-    """Try to import ctrader_open_api and populate protobuf registry. Returns True on success."""
+    """Try to import ctrader_open_api and populate protobuf registry."""
     try:
         from ctrader_open_api import Protobuf
 
@@ -70,43 +82,50 @@ class CTraderBridge(QObject):
     """Qt-thread bridge for cTrader Open API.
 
     All public methods are safe to call from the Qt main thread.
-    Signals are emitted on the Qt main thread.
-    If ctrader_open_api is unavailable, all methods are safe no-ops.
+    Signals are emitted on the Qt main thread (Qt signals are thread-safe).
     """
 
     # Signals
-    connected = pyqtSignal(bool, str)  # (is_connected, message)
-    order_opened = pyqtSignal(str, int, str)  # (pair, position_id, direction)
-    order_closed = pyqtSignal(str, int)  # (pair, position_id)
-    order_error = pyqtSignal(str, str)  # (pair, error_message)
-    positions_synced = pyqtSignal(list)  # list of position dicts
+    connected = pyqtSignal(bool, str)
+    order_opened = pyqtSignal(str, int, str)
+    order_closed = pyqtSignal(str, int)
+    order_error = pyqtSignal(str, str)
+    positions_synced = pyqtSignal(list)
+    balance_updated = pyqtSignal(float)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._client: Any = None
         self._config: dict[str, Any] = {}
         self._account_id: int = 0
-        self._symbol_map: dict[str, int] = {}  # "EURUSD" -> symbol_id
-        self._position_symbols: dict[int, str] = {}  # position_id -> pair
+        self._symbol_map: dict[str, int] = {}
+        self._position_symbols: dict[int, str] = {}
         self._is_connected = False
-        self._reconnect_delay = 5.0
-        self._max_reconnect_delay = 60.0
+        self._is_authenticated = False  # account-level auth
         self._stopping = False
         self._sdk_loaded = False
+        self._error_count = 0
+        self._backoff_call: Any = None  # pending callLater handle
+        # Rate limit escalation: count consecutive BLOCKED_PAYLOAD_TYPE hits
+        # to back off longer each time (5min → 15min → 30min → 60min → give up)
+        self._rate_limit_hits = 0
+        self._last_rate_limit_ts = 0.0
 
     # ── Public API (called from Qt thread) ────────────────────────
 
     def start(self, config: dict[str, Any]) -> None:
-        """Connect to cTrader with the given config.
-
-        Starts the Twisted reactor on first call (lazy).
-        """
+        """Connect to cTrader with the given config."""
         self._config = config
-        self._account_id = int(config.get("ctrader_account_id", 0))
+        try:
+            self._account_id = int(str(config.get("ctrader_account_id", 0) or 0))
+        except (ValueError, TypeError):
+            logger.error("cTrader invalid account_id: %r", config.get("ctrader_account_id"))
+            return
+        if self._account_id == 0:
+            logger.error("cTrader account_id is 0 — not starting")
+            return
         self._stopping = False
-        self._reconnect_delay = 5.0
 
-        # Lazy init: start reactor + load SDK only when actually needed
         if not self._sdk_loaded:
             self._sdk_loaded = _load_ctrader_sdk()
             if not self._sdk_loaded:
@@ -114,78 +133,90 @@ class CTraderBridge(QObject):
                 return
 
         if not _ensure_reactor():
-            logger.error("Twisted reactor unavailable — cannot start")
             return
 
         try:
             from twisted.internet import reactor
-
             reactor.callFromThread(self._connect)
         except Exception as exc:
             logger.error("Failed to schedule cTrader connect: %s", exc)
 
     def stop(self) -> None:
-        """Disconnect and stop reconnection."""
+        """Disconnect and stop reconnection permanently (app shutdown)."""
         self._stopping = True
-        if self._client:
-            try:
-                from twisted.internet import reactor
-
-                reactor.callFromThread(self._disconnect)
-            except Exception:
-                pass
-
-    def open_order(self, pair: str, direction: str, volume_lots: float) -> None:
-        """Send market order. volume_lots is in standard lots (e.g. 0.01)."""
-        if not self._is_connected:
-            return
-
-        symbol_id = self._symbol_map.get(pair.upper())
-        if symbol_id is None:
-            self._emit_error(pair, f"Symbol {pair} not found in cTrader")
-            return
-
         try:
             from twisted.internet import reactor
-            from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
-                ProtoOATradeSide,
-            )
+            reactor.callFromThread(self._shutdown)
+        except Exception:
+            pass
 
-            # cTrader volume is in cents: 1 lot = 100_000 units = 10_000_000 cents
+    def open_order(
+        self, pair: str, direction: str, volume_lots: float,
+        sl_price: float = 0.0, tp_price: float = 0.0,
+        sl_pips: float = 0.0, tp_pips: float = 0.0,
+    ) -> None:
+        """Send market order with optional SL/TP."""
+        if not self._is_connected:
+            self._emit_error(pair, "Not connected")
+            return
+        symbol_id = self._symbol_map.get(pair.upper())
+        if symbol_id is None:
+            self._emit_error(pair, f"Symbol {pair} not found")
+            return
+        try:
+            from twisted.internet import reactor
+            from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATradeSide
+
             volume_cents = int(round(volume_lots * 100_000 * 100))
-            trade_side = (
-                ProtoOATradeSide.Value("BUY")
-                if direction == "BUY"
-                else ProtoOATradeSide.Value("SELL")
-            )
+            trade_side = ProtoOATradeSide.Value("BUY" if direction == "BUY" else "SELL")
+
+            # relativeStopLoss units: 1/100,000 of price
+            # Non-JPY: pips × 10 (pip=0.0001)
+            # JPY:     pips × 1000 (pip=0.01)
+            if "JPY" in pair:
+                sl_pipettes = int(round(sl_pips * 1000)) if sl_pips > 0 else 0
+                tp_pipettes = int(round(tp_pips * 1000)) if tp_pips > 0 else 0
+            else:
+                sl_pipettes = int(round(sl_pips * 10)) if sl_pips > 0 else 0
+                tp_pipettes = int(round(tp_pips * 10)) if tp_pips > 0 else 0
+
             reactor.callFromThread(
-                self._send_market_order, pair, symbol_id, trade_side, volume_cents
+                self._send_market_order, pair, symbol_id, trade_side, volume_cents,
+                sl_pipettes, tp_pipettes,
             )
         except Exception as exc:
             logger.error("Failed to send order: %s", exc)
+            # Emit error so main_window clears _ct_open_positions and doesn't
+            # leave the pair silently blocked
+            self._emit_error(pair, f"Order send failed: {exc}")
 
     def close_position(self, position_id: int, volume_lots: float) -> None:
-        """Close (or partially close) a position."""
         if not self._is_connected:
             return
         try:
             from twisted.internet import reactor
-
             volume_cents = int(round(volume_lots * 100_000 * 100))
             reactor.callFromThread(self._send_close_position, position_id, volume_cents)
         except Exception as exc:
             logger.error("Failed to close position: %s", exc)
 
     def reconcile(self) -> None:
-        """Request position reconciliation from broker."""
         if not self._is_connected:
             return
         try:
             from twisted.internet import reactor
-
             reactor.callFromThread(self._send_reconcile)
         except Exception as exc:
             logger.error("Failed to reconcile: %s", exc)
+
+    def query_balance(self) -> None:
+        if not self._is_connected:
+            return
+        try:
+            from twisted.internet import reactor
+            reactor.callFromThread(self._query_balance)
+        except Exception:
+            pass
 
     @property
     def is_connected(self) -> bool:
@@ -194,207 +225,414 @@ class CTraderBridge(QObject):
     # ── Twisted-thread methods ────────────────────────────────────
 
     def _connect(self) -> None:
-        """Create Client and connect (runs in Twisted thread)."""
+        """Create Client and start service (runs in Twisted thread).
+
+        Canonical Spotware pattern: create Client once, set callbacks,
+        startService(). ClientService handles reconnection with the default
+        retry policy (Twisted exponential backoff, infinite retries).
+        """
+        if self._stopping:
+            return  # don't reconnect after stop() was called
+        self._backoff_call = None  # clear any pending backoff reference
+        if self._client:
+            # Already have a client — ensure it's running
+            if not self._client.running:
+                self._client.startService()
+            return
         try:
             from ctrader_open_api import Client, EndPoints, TcpProtocol
 
-            host = self._config.get("ctrader_host", EndPoints.PROTOBUF_DEMO_HOST)
-            port = int(self._config.get("ctrader_port", EndPoints.PROTOBUF_PORT))
+            # Host selection: ctrader_live config flag chooses between demo/live.
+            # Explicit override via ctrader_host still wins if provided.
+            is_live = bool(self._config.get("ctrader_live", False))
+            default_host = (
+                EndPoints.PROTOBUF_LIVE_HOST if is_live
+                else EndPoints.PROTOBUF_DEMO_HOST
+            )
+            host = self._config.get("ctrader_host") or default_host
+            port = int(self._config.get("ctrader_port") or EndPoints.PROTOBUF_PORT)
 
+            # Use default retryPolicy (Twisted's built-in exponential backoff)
             self._client = Client(host, port, TcpProtocol)
             self._client.setConnectedCallback(self._on_connected)
             self._client.setDisconnectedCallback(self._on_disconnected)
             self._client.setMessageReceivedCallback(self._on_message)
             self._client.startService()
-            logger.info("cTrader client connecting to %s:%d", host, port)
+            logger.info(
+                "cTrader connecting to %s:%d (%s)",
+                host, port, "LIVE" if is_live else "DEMO",
+            )
         except Exception as exc:
             logger.error("cTrader connect failed: %s", exc)
             self._emit_error("", f"Connect failed: {exc}")
 
-    def _disconnect(self) -> None:
-        """Stop client (runs in Twisted thread)."""
-        try:
-            if self._client:
-                self._client.stopService()
-                self._client = None
-        except Exception:
-            pass
-        self._is_connected = False
-
-    def _on_connected(self, client: Any) -> None:
-        """Connected callback — start auth flow."""
-        logger.info("cTrader TCP connected, sending app auth")
-        client_id = self._config.get("ctrader_client_id", "")
-        client_secret = self._config.get("ctrader_client_secret", "")
-        d = client.send(
-            "ProtoOAApplicationAuthReq",
-            clientId=client_id,
-            clientSecret=client_secret,
-        )
-        d.addErrback(self._on_error, "App auth failed")
-
-    def _on_disconnected(self, client: Any, reason: Any) -> None:
-        """Disconnected callback — attempt reconnect."""
-        self._is_connected = False
-        msg = f"Disconnected: {reason}"
-        logger.warning("cTrader %s", msg)
-        self._emit_connected(False, msg)
-
-        if not self._stopping:
+    def _shutdown(self) -> None:
+        """Full shutdown: stop client (runs in Twisted thread)."""
+        # Cancel any pending backoff reconnect
+        if self._backoff_call is not None:
             try:
-                from twisted.internet import reactor
-
-                logger.info(
-                    "cTrader reconnecting in %.0fs", self._reconnect_delay
-                )
-                reactor.callLater(self._reconnect_delay, self._reconnect)
-                self._reconnect_delay = min(
-                    self._reconnect_delay * 2, self._max_reconnect_delay
-                )
+                if self._backoff_call.active():
+                    self._backoff_call.cancel()
             except Exception:
                 pass
+            self._backoff_call = None
+        if self._client:
+            try:
+                self._client.stopService()
+            except Exception:
+                pass
+            self._client = None
+        self._is_connected = False
+        self._is_authenticated = False
+        # Clear stale symbol data
+        self._symbol_map.clear()
+        self._position_symbols.clear()
 
-    def _reconnect(self) -> None:
-        """Reconnect after delay (runs in Twisted thread)."""
+    def _backoff_reconnect(self, delay_seconds: int = 300) -> None:
+        """Stop the client service, wait, then restart fresh.
+
+        Used when the server rate-limits us — ClientService would just
+        reconnect immediately otherwise, triggering the rate limit again.
+        Runs in Twisted thread.
+        """
         if self._stopping:
             return
-        self._connect()
+        logger.warning("cTrader backoff reconnect scheduled in %ds", delay_seconds)
+        self._is_connected = False
+        self._is_authenticated = False
+        # Clear stale state from the dead connection
+        self._symbol_map.clear()
+        self._position_symbols.clear()
+        # Stop the current service (cancels ClientService's reconnection)
+        if self._client:
+            try:
+                self._client.stopService()
+            except Exception:
+                pass
+            self._client = None
+        # Cancel any existing backoff call (avoid duplicates)
+        if self._backoff_call is not None:
+            try:
+                if self._backoff_call.active():
+                    self._backoff_call.cancel()
+            except Exception:
+                pass
+        # Schedule a clean restart after the delay
+        try:
+            from twisted.internet import reactor
+            self._backoff_call = reactor.callLater(delay_seconds, self._connect)
+        except Exception as exc:
+            logger.error("Failed to schedule backoff reconnect: %s", exc)
+
+    def _on_connected(self, client: Any) -> None:
+        """Connected callback — send app auth.
+
+        Called by ClientService on initial connect AND every auto-reconnect.
+        We always re-send ProtoOAApplicationAuthReq.
+        """
+        logger.info("cTrader TCP connected, sending app auth")
+        self._is_authenticated = False
+        self._error_count = 0
+
+        try:
+            import datetime as _dt
+            with open("D:/Trading/TAKUMI Trader/data/ctrader_connect.log", "a") as f:
+                f.write(f"{_dt.datetime.now():%Y-%m-%d %H:%M:%S} CONNECTED\n")
+        except Exception:
+            pass
+
+        client_id = self._config.get("ctrader_client_id", "")
+        client_secret = self._config.get("ctrader_client_secret", "")
+        if not client_id or not client_secret:
+            logger.error("cTrader missing client_id/client_secret")
+            return
+
+        try:
+            d = client.send(
+                "ProtoOAApplicationAuthReq",
+                clientId=client_id,
+                clientSecret=client_secret,
+            )
+            d.addErrback(self._on_error, "App auth")
+        except Exception as exc:
+            logger.error("cTrader app auth send failed: %s", exc)
+
+    def _on_disconnected(self, client: Any, reason: Any) -> None:
+        """Disconnected callback — just log. ClientService auto-reconnects."""
+        self._is_connected = False
+        self._is_authenticated = False
+        logger.warning("cTrader disconnected: %s", reason)
+        self.connected.emit(False, f"Disconnected: {reason}")
+
+        try:
+            import datetime as _dt
+            with open("D:/Trading/TAKUMI Trader/data/ctrader_connect.log", "a") as f:
+                f.write(f"{_dt.datetime.now():%Y-%m-%d %H:%M:%S} DISCONNECTED: {reason}\n")
+        except Exception:
+            pass
+
+    # ── Message handling ─────────────────────────────────────────
 
     def _on_message(self, client: Any, message: Any) -> None:
         """Handle incoming Protobuf messages (runs in Twisted thread)."""
         try:
             from ctrader_open_api import Protobuf
 
-            payload_type = message.payloadType
+            pt = message.payloadType
 
-            if payload_type == _PT_APP_AUTH_RES:
-                logger.info("cTrader app auth OK, sending account auth")
-                access_token = self._config.get("ctrader_access_token", "")
-                d = client.send(
-                    "ProtoOAAccountAuthReq",
-                    ctidTraderAccountId=self._account_id,
-                    accessToken=access_token,
-                )
-                d.addErrback(self._on_error, "Account auth failed")
+            # Skip heartbeat noise
+            if pt == _PT_HEARTBEAT:
+                return
 
-            elif payload_type == _PT_ACCOUNT_AUTH_RES:
+            if pt == _PT_APP_AUTH_RES:
+                logger.info("cTrader app auth OK")
+                # Automatically re-send account auth (canonical pattern)
+                if self._account_id:
+                    self._send_account_auth(client)
+
+            elif pt == _PT_ACCOUNT_AUTH_RES:
                 logger.info("cTrader account auth OK, fetching symbols")
-                self._reconnect_delay = 5.0  # reset backoff
+                self._is_authenticated = True
+                self._error_count = 0
                 d = client.send(
                     "ProtoOASymbolsListReq",
                     ctidTraderAccountId=self._account_id,
                 )
-                d.addErrback(self._on_error, "Symbol list failed")
+                d.addErrback(self._on_error, "Symbol list")
 
-            elif payload_type == _PT_SYMBOLS_LIST_RES:
+            elif pt == _PT_SYMBOLS_LIST_RES:
                 extracted = Protobuf.extract(message)
                 self._build_symbol_map(extracted)
                 self._is_connected = True
-                self._emit_connected(True, "Connected & authenticated")
-                logger.info(
-                    "cTrader ready — %d symbols mapped", len(self._symbol_map)
-                )
-                # Reconcile positions on connect
+                self._rate_limit_hits = 0  # reset escalation counter on success
+                self.connected.emit(True, "Connected & authenticated")
+                logger.info("cTrader ready — %d symbols mapped", len(self._symbol_map))
                 self._send_reconcile()
+                self._query_balance()
 
-            elif payload_type == _PT_EXECUTION_EVENT:
+            elif pt == 2148:  # ProtoOATraderRes
+                extracted = Protobuf.extract(message)
+                balance = getattr(extracted, "balance", 0) / 100.0
+                if balance > 0:
+                    logger.info("cTrader balance: %.2f", balance)
+                    self.balance_updated.emit(balance)
+
+            elif pt == _PT_EXECUTION_EVENT:
                 extracted = Protobuf.extract(message)
                 self._handle_execution_event(extracted)
 
-            elif payload_type == _PT_ERROR_RES:
+            elif pt == _PT_ERROR_RES:
                 extracted = Protobuf.extract(message)
-                error_code = getattr(extracted, "errorCode", "?")
-                description = getattr(extracted, "description", "Unknown error")
-                logger.error("cTrader error: %s — %s", error_code, description)
-                self._emit_error("", f"{error_code}: {description}")
+                code = getattr(extracted, "errorCode", "?")
+                desc = getattr(extracted, "description", "Unknown")
+                code_s = str(code)
+                desc_s = str(desc)
+                # Log all error responses to connect log for debugging
+                try:
+                    import datetime as _dt
+                    with open("D:/Trading/TAKUMI Trader/data/ctrader_connect.log", "a") as f:
+                        f.write(f"{_dt.datetime.now():%Y-%m-%d %H:%M:%S} ERROR_RES: {code_s} — {desc_s}\n")
+                except Exception:
+                    pass
 
-            elif payload_type == _PT_RECONCILE_RES:
+                if "ALREADY_LOGGED_IN" in code_s:
+                    logger.info("cTrader already logged in, sending account auth")
+                    self._send_account_auth(client)
+                elif "BLOCKED_PAYLOAD_TYPE" in code_s or "rate limit" in desc_s.lower():
+                    # Server is rate-limiting us. Escalate backoff on consecutive
+                    # hits since the server's block window is longer than 5 min.
+                    now = time.monotonic()
+                    if now - self._last_rate_limit_ts < 3600:
+                        # Within an hour of the last hit — consecutive
+                        self._rate_limit_hits += 1
+                    else:
+                        self._rate_limit_hits = 1
+                    self._last_rate_limit_ts = now
+
+                    # Escalating delay: 15min, 30min, 60min, 120min, then stop
+                    delays = [900, 1800, 3600, 7200]
+                    if self._rate_limit_hits > len(delays):
+                        logger.error(
+                            "cTrader RATE LIMITED %d times — stopping reconnection. "
+                            "Restart TAKUMI manually after waiting 2+ hours.",
+                            self._rate_limit_hits,
+                        )
+                        self._emit_error(
+                            "",
+                            f"Rate limit persistent ({self._rate_limit_hits} hits) — "
+                            "stopped auto-reconnect. Restart app after 2+ hours.",
+                        )
+                        # Permanent stop until manual restart
+                        self._stopping = True
+                        self._shutdown()
+                    else:
+                        delay = delays[self._rate_limit_hits - 1]
+                        logger.error(
+                            "cTrader RATE LIMITED (hit #%d): %s. Backing off %d min.",
+                            self._rate_limit_hits, desc_s, delay // 60,
+                        )
+                        self._emit_error(
+                            "",
+                            f"Rate limited (hit #{self._rate_limit_hits}) — "
+                            f"waiting {delay // 60} min",
+                        )
+                        self._backoff_reconnect(delay_seconds=delay)
+                elif "NOT_AUTHORIZED" in code_s or "CH_ACCESS_TOKEN" in desc_s:
+                    logger.error("cTrader ACCESS TOKEN EXPIRED: %s — %s", code_s, desc_s)
+                    self._emit_error("", f"Access token expired: {desc_s}")
+                else:
+                    logger.error("cTrader error: %s — %s", code_s, desc_s)
+                    self._emit_error("", f"{code_s}: {desc_s}")
+
+            elif pt == _PT_RECONCILE_RES:
                 extracted = Protobuf.extract(message)
                 self._handle_reconcile(extracted)
 
         except Exception as exc:
             logger.error("cTrader message handling error: %s", exc)
 
+    def _send_account_auth(self, client: Any) -> None:
+        """Send account auth (runs in Twisted thread)."""
+        access_token = self._config.get("ctrader_access_token", "")
+        try:
+            d = client.send(
+                "ProtoOAAccountAuthReq",
+                ctidTraderAccountId=self._account_id,
+                accessToken=access_token,
+            )
+            d.addErrback(self._on_error, "Account auth")
+        except Exception as exc:
+            logger.error("cTrader account auth send failed: %s", exc)
+
     def _on_error(self, failure: Any, context: str = "") -> None:
-        """Deferred errback handler."""
-        logger.error("cTrader %s: %s", context, failure)
-        self._emit_error("", f"{context}: {failure}")
+        """Deferred errback — log with throttling for connection noise."""
+        # Filter out "cancelled" errors caused by disconnects (expected)
+        err_str = str(failure)
+        if "Deferred" in err_str and "Cancelled" in err_str:
+            return
+        # Order errors are critical — always log (not throttled)
+        if context.startswith("Order "):
+            logger.warning("cTrader %s: %s", context, err_str[:200])
+            return
+        # Connection-level errors get throttled to prevent log spam
+        if not hasattr(self, "_error_count"):
+            self._error_count = 0
+        self._error_count += 1
+        if self._error_count <= 3:
+            logger.warning("cTrader %s: %s", context, err_str[:200])
 
     # ── Symbol mapping ────────────────────────────────────────────
 
     def _build_symbol_map(self, symbols_res: Any) -> None:
-        """Build symbol name → ID mapping from ProtoOASymbolsListRes."""
-        self._symbol_map.clear()
+        # Build new dict locally then assign atomically — prevents the Qt
+        # thread from observing a half-rebuilt map during concurrent order sends
+        new_map: dict[str, int] = {}
         for symbol in symbols_res.symbol:
-            # symbolName may be like "EUR/USD" or "EURUSD"
             name = getattr(symbol, "symbolName", "")
             normalized = name.replace("/", "").replace(" ", "").upper()
-            symbol_id = symbol.symbolId
             if normalized:
-                self._symbol_map[normalized] = symbol_id
+                new_map[normalized] = symbol.symbolId
+        self._symbol_map = new_map
 
     # ── Order sending ─────────────────────────────────────────────
 
     def _send_market_order(
-        self, pair: str, symbol_id: int, trade_side: int, volume: int
+        self, pair: str, symbol_id: int, trade_side: int, volume: int,
+        sl_pipettes: int = 0, tp_pipettes: int = 0,
     ) -> None:
-        """Send market order (runs in Twisted thread)."""
         if not self._client or not self._is_connected:
             self._emit_error(pair, "Not connected")
             return
         try:
-            from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
-                ProtoOAOrderType,
-            )
+            from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
 
-            logger.info(
-                "cTrader sending MARKET %s %s vol=%d",
-                "BUY" if trade_side == 1 else "SELL",
-                pair,
-                volume,
-            )
-            d = self._client.send(
-                "ProtoOANewOrderReq",
+            params = dict(
                 ctidTraderAccountId=self._account_id,
                 symbolId=symbol_id,
                 orderType=ProtoOAOrderType.Value("MARKET"),
                 tradeSide=trade_side,
                 volume=volume,
             )
-            d.addErrback(self._on_error, f"Order {pair} failed")
+            if sl_pipettes > 0:
+                params["relativeStopLoss"] = sl_pipettes
+            if tp_pipettes > 0:
+                params["relativeTakeProfit"] = tp_pipettes
+
+            logger.info(
+                "cTrader MARKET %s %s vol=%d SL=%d TP=%d",
+                "BUY" if trade_side == 1 else "SELL",
+                pair, volume, sl_pipettes, tp_pipettes,
+            )
+
+            try:
+                with open("D:/Trading/TAKUMI Trader/data/ctrader_orders.log", "a") as _f:
+                    _f.write(f"SENDING: {pair} side={trade_side} vol={volume} "
+                             f"sl_pip={sl_pipettes} tp_pip={tp_pipettes}\n")
+            except Exception:
+                pass
+
+            d = self._client.send("ProtoOANewOrderReq", **params)
+
+            def _order_cb(result, p=pair):
+                try:
+                    from ctrader_open_api import Protobuf
+                    with open("D:/Trading/TAKUMI Trader/data/ctrader_orders.log", "a") as _f:
+                        if result.payloadType == 2132:
+                            ex = Protobuf.extract(result)
+                            code = getattr(ex, "errorCode", "?")
+                            desc = getattr(ex, "description", "?")
+                            _f.write(f"REJECTED: {p} {code}: {desc}\n")
+                            self._emit_error(p, f"Order rejected: {code}: {desc}")
+                        else:
+                            _f.write(f"FILLED: {p} type={result.payloadType}\n")
+                except Exception:
+                    pass
+
+            d.addCallback(_order_cb)
+            d.addErrback(self._on_error, f"Order {pair}")
         except Exception as exc:
             logger.error("Failed to send market order: %s", exc)
 
     def _send_close_position(self, position_id: int, volume: int) -> None:
-        """Send close position request (runs in Twisted thread)."""
         if not self._client or not self._is_connected:
             return
-        logger.info("cTrader closing position %d vol=%d", position_id, volume)
+        logger.info("cTrader closing pos=%d vol=%d", position_id, volume)
         d = self._client.send(
             "ProtoOAClosePositionReq",
             ctidTraderAccountId=self._account_id,
             positionId=position_id,
             volume=volume,
         )
-        d.addErrback(self._on_error, f"Close position {position_id} failed")
+        d.addErrback(self._on_error, f"Close pos={position_id}")
+
+    def _query_balance(self) -> None:
+        if not self._client or not self._is_connected:
+            return
+        try:
+            d = self._client.send(
+                "ProtoOATraderReq",
+                ctidTraderAccountId=self._account_id,
+            )
+            d.addErrback(self._on_error, "Balance query")
+        except Exception as exc:
+            logger.warning("Balance query error: %s", exc)
 
     def _send_reconcile(self) -> None:
-        """Send reconcile request (runs in Twisted thread)."""
         if not self._client or not self._is_connected:
             return
         d = self._client.send(
             "ProtoOAReconcileReq",
             ctidTraderAccountId=self._account_id,
         )
-        d.addErrback(self._on_error, "Reconcile failed")
+        d.addErrback(self._on_error, "Reconcile")
 
     # ── Execution event handling ──────────────────────────────────
 
     def _handle_execution_event(self, event: Any) -> None:
-        """Process execution events (fills, closures)."""
         try:
             from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
                 ProtoOAExecutionType,
+                ProtoOAPositionStatus,
             )
 
             exec_type = event.executionType
@@ -402,28 +640,41 @@ class CTraderBridge(QObject):
             order = getattr(event, "order", None)
 
             if exec_type == ProtoOAExecutionType.Value("ORDER_FILLED"):
-                if position:
-                    pos_id = position.positionId
-                    symbol_id = position.tradeData.symbolId
-                    trade_side = position.tradeData.tradeSide
-                    price = position.price / 100_000.0 if position.price else 0.0
+                if not position:
+                    return
+                pos_id = position.positionId
+                symbol_id = position.tradeData.symbolId
+                trade_side = position.tradeData.tradeSide
+                price = position.price / 100_000.0 if position.price else 0.0
+                pair = self._symbol_id_to_name(symbol_id)
+                direction = "BUY" if trade_side == 1 else "SELL"
 
-                    pair = self._symbol_id_to_name(symbol_id)
-                    direction = "BUY" if trade_side == 1 else "SELL"
-                    self._position_symbols[pos_id] = pair
+                # Distinguish OPEN fill from CLOSE fill (SL/TP hit, manual close)
+                pos_status = getattr(position, "positionStatus", 0)
+                closed_status = ProtoOAPositionStatus.Value("POSITION_STATUS_CLOSED")
+                closing_order = bool(getattr(order, "closingOrder", False)) if order else False
 
+                if pos_status == closed_status or closing_order:
+                    # Position closed (SL/TP hit, manual close, etc.)
+                    self._position_symbols.pop(pos_id, None)
                     logger.info(
-                        "cTrader ORDER_FILLED: %s %s pos=%d @ %.5f",
+                        "cTrader POSITION CLOSED: %s pos=%d @ %.5f",
+                        pair, pos_id, price,
+                    )
+                    self.order_closed.emit(pair, pos_id)
+                else:
+                    # New position opened
+                    self._position_symbols[pos_id] = pair
+                    logger.info(
+                        "cTrader POSITION OPENED: %s %s pos=%d @ %.5f",
                         direction, pair, pos_id, price,
                     )
-                    self._emit_order_opened(pair, pos_id, direction)
+                    self.order_opened.emit(pair, pos_id, direction)
 
             elif exec_type == ProtoOAExecutionType.Value("ORDER_CANCELLED"):
-                if order and position:
-                    pos_id = position.positionId
-                    pair = self._position_symbols.pop(pos_id, "UNKNOWN")
-                    logger.info("cTrader position closed: %s pos=%d", pair, pos_id)
-                    self._emit_order_closed(pair, pos_id)
+                # Cancelled order (not a position close)
+                if order:
+                    logger.info("cTrader ORDER_CANCELLED: order=%s", getattr(order, "orderId", "?"))
 
             elif exec_type == ProtoOAExecutionType.Value("ORDER_REJECTED"):
                 error_msg = getattr(event, "errorCode", "Rejected")
@@ -439,80 +690,30 @@ class CTraderBridge(QObject):
             logger.error("Execution event handling error: %s", exc)
 
     def _handle_reconcile(self, reconcile_res: Any) -> None:
-        """Process reconcile response — sync open positions."""
         positions = []
+        # Rebuild position_symbols from scratch to prune stale entries
+        new_pos_symbols: dict[int, str] = {}
         for pos in reconcile_res.position:
             symbol_id = pos.tradeData.symbolId
             pair = self._symbol_id_to_name(symbol_id)
-            trade_side = pos.tradeData.tradeSide
-            direction = "BUY" if trade_side == 1 else "SELL"
-            volume_cents = pos.tradeData.volume
-            volume_lots = volume_cents / (100_000 * 100)
+            direction = "BUY" if pos.tradeData.tradeSide == 1 else "SELL"
+            volume_lots = pos.tradeData.volume / (100_000 * 100)
             price = pos.price / 100_000.0 if pos.price else 0.0
             pos_id = pos.positionId
-
-            self._position_symbols[pos_id] = pair
+            new_pos_symbols[pos_id] = pair
             positions.append({
                 "pair": pair, "direction": direction,
                 "position_id": pos_id, "volume": volume_lots, "price": price,
             })
-
+        self._position_symbols = new_pos_symbols
         logger.info("cTrader reconcile: %d open positions", len(positions))
-        QMetaObject.invokeMethod(
-            self, "_emit_positions_synced_slot",
-            Qt.ConnectionType.QueuedConnection, Q_ARG(list, positions),
-        )
+        self.positions_synced.emit(positions)
 
     def _symbol_id_to_name(self, symbol_id: int) -> str:
-        """Reverse lookup: symbol_id → pair name."""
         for name, sid in self._symbol_map.items():
             if sid == symbol_id:
                 return name
         return f"ID:{symbol_id}"
 
-    # ── Thread-safe signal emission ───────────────────────────────
-
-    def _emit_connected(self, is_connected: bool, msg: str) -> None:
-        QMetaObject.invokeMethod(
-            self, "_emit_connected_slot",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(bool, is_connected), Q_ARG(str, msg),
-        )
-
-    def _emit_order_opened(self, pair: str, pos_id: int, direction: str) -> None:
-        QMetaObject.invokeMethod(
-            self, "_emit_order_opened_slot",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(str, pair), Q_ARG(int, pos_id), Q_ARG(str, direction),
-        )
-
-    def _emit_order_closed(self, pair: str, pos_id: int) -> None:
-        QMetaObject.invokeMethod(
-            self, "_emit_order_closed_slot",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(str, pair), Q_ARG(int, pos_id),
-        )
-
     def _emit_error(self, pair: str, msg: str) -> None:
-        QMetaObject.invokeMethod(
-            self, "_emit_error_slot",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(str, pair), Q_ARG(str, msg),
-        )
-
-    # ── Slots for QMetaObject.invokeMethod ────────────────────────
-
-    def _emit_connected_slot(self, is_connected: bool, msg: str) -> None:
-        self.connected.emit(is_connected, msg)
-
-    def _emit_order_opened_slot(self, pair: str, pos_id: int, direction: str) -> None:
-        self.order_opened.emit(pair, pos_id, direction)
-
-    def _emit_order_closed_slot(self, pair: str, pos_id: int) -> None:
-        self.order_closed.emit(pair, pos_id)
-
-    def _emit_error_slot(self, pair: str, msg: str) -> None:
         self.order_error.emit(pair, msg)
-
-    def _emit_positions_synced_slot(self, positions: list) -> None:
-        self.positions_synced.emit(positions)

@@ -30,19 +30,13 @@ def load_settings() -> dict:
     """Load persisted settings from QSettings.
 
     Returns:
-        Dict with keys: sound_file, sound_enabled, cooldown_seconds,
-        csi_* keys, + ctrader_* keys.
+        Dict with keys: sound_file, sound_enabled, cooldown_seconds, + ctrader_* keys.
     """
     s = QSettings(SETTINGS_ORG, SETTINGS_APP)
     return {
         "sound_file": s.value("alerts/sound_file", "", type=str),
         "sound_enabled": s.value("alerts/sound_enabled", True, type=bool),
         "cooldown_seconds": s.value("alerts/cooldown_seconds", 60, type=int),
-        # CSI / QM4 alerts
-        "csi_sound_file": s.value("csi/sound_file", "", type=str),
-        "csi_sound_enabled": s.value("csi/sound_enabled", True, type=bool),
-        "csi_cooldown_minutes": s.value("csi/cooldown_minutes", 5, type=int),
-        "ocr_enabled": s.value("ocr/enabled", False, type=bool),
         "font_size": s.value("ui/font_size", 10, type=int),
         "compact_mode": s.value("ui/compact_mode", False, type=bool),
         # cTrader auto-trading
@@ -52,8 +46,6 @@ def load_settings() -> dict:
         "ctrader_access_token": s.value("ctrader/access_token", "", type=str),
         "ctrader_account_id": s.value("ctrader/account_id", "", type=str),
         "ctrader_lot_size": s.value("ctrader/lot_size", 0.01, type=float),
-        "ctrader_balance": s.value("ctrader/balance", 100000.0, type=float),
-        "ctrader_risk_pct": s.value("ctrader/risk_pct", 0.1, type=float),
         "ctrader_auto_open": s.value("ctrader/auto_open", True, type=bool),
         "ctrader_auto_close": s.value("ctrader/auto_close", True, type=bool),
         "ctrader_max_positions": s.value("ctrader/max_positions", 3, type=int),
@@ -74,11 +66,6 @@ def save_settings(settings: dict) -> None:
     s.setValue("alerts/cooldown_seconds", settings["cooldown_seconds"])
     s.setValue("ui/font_size", settings["font_size"])
     s.setValue("ui/compact_mode", settings.get("compact_mode", False))
-    # CSI / QM4 alerts
-    s.setValue("csi/sound_file", settings.get("csi_sound_file", ""))
-    s.setValue("csi/sound_enabled", settings.get("csi_sound_enabled", True))
-    s.setValue("csi/cooldown_minutes", settings.get("csi_cooldown_minutes", 5))
-    s.setValue("ocr/enabled", settings.get("ocr_enabled", False))
     # cTrader auto-trading
     s.setValue("ctrader/enabled", settings.get("ctrader_enabled", False))
     s.setValue("ctrader/client_id", settings.get("ctrader_client_id", ""))
@@ -86,8 +73,6 @@ def save_settings(settings: dict) -> None:
     s.setValue("ctrader/access_token", settings.get("ctrader_access_token", ""))
     s.setValue("ctrader/account_id", settings.get("ctrader_account_id", ""))
     s.setValue("ctrader/lot_size", settings.get("ctrader_lot_size", 0.01))
-    s.setValue("ctrader/balance", settings.get("ctrader_balance", 100000.0))
-    s.setValue("ctrader/risk_pct", settings.get("ctrader_risk_pct", 0.1))
     s.setValue("ctrader/auto_open", settings.get("ctrader_auto_open", True))
     s.setValue("ctrader/auto_close", settings.get("ctrader_auto_close", True))
     s.setValue("ctrader/max_positions", settings.get("ctrader_max_positions", 3))
@@ -191,30 +176,20 @@ class SettingsDialog(QDialog):
             self._ct_inputs[key] = inp
             ct_layout.addLayout(row)
 
-        # Balance + Risk % + Max positions
+        # Lot size + max positions
         param_row = QHBoxLayout()
-        param_row.addWidget(QLabel("Balance:"))
-        self.spin_ct_balance = QDoubleSpinBox()
-        self.spin_ct_balance.setRange(100, 100_000_000)
-        self.spin_ct_balance.setSingleStep(1000)
-        self.spin_ct_balance.setDecimals(0)
-        self.spin_ct_balance.setValue(100000)
-        self.spin_ct_balance.setPrefix("¥ ")
-        param_row.addWidget(self.spin_ct_balance)
-        param_row.addSpacing(8)
-        param_row.addWidget(QLabel("Risk:"))
-        self.spin_ct_risk = QDoubleSpinBox()
-        self.spin_ct_risk.setRange(0.01, 10.0)
-        self.spin_ct_risk.setSingleStep(0.1)
-        self.spin_ct_risk.setDecimals(2)
-        self.spin_ct_risk.setValue(0.1)
-        self.spin_ct_risk.setSuffix(" %")
-        param_row.addWidget(self.spin_ct_risk)
-        param_row.addSpacing(8)
-        param_row.addWidget(QLabel("Max pos:"))
+        param_row.addWidget(QLabel("Lot size:"))
+        self.spin_ct_lot = QDoubleSpinBox()
+        self.spin_ct_lot.setRange(0.01, 1.0)
+        self.spin_ct_lot.setSingleStep(0.01)
+        self.spin_ct_lot.setDecimals(2)
+        self.spin_ct_lot.setValue(0.01)
+        param_row.addWidget(self.spin_ct_lot)
+        param_row.addSpacing(16)
+        param_row.addWidget(QLabel("Max positions:"))
         self.spin_ct_max_pos = QSpinBox()
-        self.spin_ct_max_pos.setRange(1, 28)
-        self.spin_ct_max_pos.setValue(28)
+        self.spin_ct_max_pos.setRange(1, 10)
+        self.spin_ct_max_pos.setValue(3)
         param_row.addWidget(self.spin_ct_max_pos)
         param_row.addStretch()
         ct_layout.addLayout(param_row)
@@ -272,54 +247,6 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(mt5_group)
 
-        # ── CSI Alerts ────────────────────────────────────────────
-        csi_group = QGroupBox("CSI Alerts (Currency Strength Index)")
-        csi_layout = QVBoxLayout(csi_group)
-        csi_layout.setSpacing(6)
-
-        self.chk_csi_enabled = QCheckBox("Enable CSI alert sound")
-        csi_layout.addWidget(self.chk_csi_enabled)
-
-        csi_file_row = QHBoxLayout()
-        csi_file_row.addWidget(QLabel("Sound file:"))
-        self.txt_csi_file = QLineEdit()
-        self.txt_csi_file.setReadOnly(True)
-        self.txt_csi_file.setPlaceholderText("Select a .wav or .mp3 file…")
-        csi_file_row.addWidget(self.txt_csi_file, stretch=1)
-        self.btn_csi_browse = QPushButton("Browse…")
-        self.btn_csi_browse.clicked.connect(self._browse_csi_file)
-        csi_file_row.addWidget(self.btn_csi_browse)
-        self.btn_csi_test = QPushButton("\u25b6 Test")
-        self.btn_csi_test.clicked.connect(self._test_csi_sound)
-        csi_file_row.addWidget(self.btn_csi_test)
-        csi_layout.addLayout(csi_file_row)
-
-        csi_cd_row = QHBoxLayout()
-        csi_cd_row.addWidget(QLabel("Cooldown:"))
-        self.spin_csi_cooldown = QSpinBox()
-        self.spin_csi_cooldown.setRange(1, 60)
-        self.spin_csi_cooldown.setValue(5)
-        self.spin_csi_cooldown.setSuffix(" min")
-        csi_cd_row.addWidget(self.spin_csi_cooldown)
-        csi_cd_row.addStretch()
-        csi_layout.addLayout(csi_cd_row)
-
-        # OCR mode
-        ocr_row = QHBoxLayout()
-        self.chk_ocr_enabled = QCheckBox("Read from QM4 screen (OCR)")
-        ocr_row.addWidget(self.chk_ocr_enabled)
-        self.btn_calibrate = QPushButton("Calibrate\u2026")
-        self.btn_calibrate.clicked.connect(self._open_calibrate)
-        ocr_row.addWidget(self.btn_calibrate)
-        ocr_row.addStretch()
-        csi_layout.addLayout(ocr_row)
-
-        self._ocr_status = QLabel("Not calibrated")
-        self._ocr_status.setStyleSheet("color: #888; font-size: 9pt;")
-        csi_layout.addWidget(self._ocr_status)
-
-        layout.addWidget(csi_group)
-
         # Explanation button
         layout.addSpacing(8)
         btn_explanation = QPushButton("\u2753 Explanation — User Manual")
@@ -372,8 +299,7 @@ class SettingsDialog(QDialog):
         self.chk_ctrader_enabled.setChecked(settings.get("ctrader_enabled", False))
         for key, inp in self._ct_inputs.items():
             inp.setText(str(settings.get(key, "")))
-        self.spin_ct_balance.setValue(settings.get("ctrader_balance", 100000.0))
-        self.spin_ct_risk.setValue(settings.get("ctrader_risk_pct", 0.1))
+        self.spin_ct_lot.setValue(settings.get("ctrader_lot_size", 0.01))
         self.spin_ct_max_pos.setValue(settings.get("ctrader_max_positions", 3))
         self.chk_ct_auto_open.setChecked(settings.get("ctrader_auto_open", True))
         self.chk_ct_auto_close.setChecked(settings.get("ctrader_auto_close", True))
@@ -383,21 +309,6 @@ class SettingsDialog(QDialog):
         self.chk_mt5_auto_close.setChecked(settings.get("mt5_auto_close", True))
         self.spin_mt5_risk.setValue(settings.get("mt5_risk_pct", 1.0))
         self.spin_mt5_max_pos.setValue(settings.get("mt5_max_positions", 5))
-        # CSI alerts
-        self.chk_csi_enabled.setChecked(settings.get("csi_sound_enabled", True))
-        self.txt_csi_file.setText(settings.get("csi_sound_file", ""))
-        self.spin_csi_cooldown.setValue(settings.get("csi_cooldown_minutes", 5))
-        # OCR
-        self.chk_ocr_enabled.setChecked(settings.get("ocr_enabled", False))
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        w = s.value("ocr/region_width", 0, type=int)
-        h = s.value("ocr/region_height", 0, type=int)
-        if w > 0 and h > 0:
-            l = s.value("ocr/region_left", 0, type=int)
-            t = s.value("ocr/region_top", 0, type=int)
-            self._ocr_status.setText(f"Region: {w}x{h} at ({l}, {t})")
-        else:
-            self._ocr_status.setText("Not calibrated")
 
     def _browse_file(self) -> None:
         """Open file dialog to select a sound file."""
@@ -413,39 +324,6 @@ class SettingsDialog(QDialog):
     def _test_sound(self) -> None:
         """Play the currently selected sound file."""
         path = self.txt_file.text()
-        if path and os.path.isfile(path):
-            play_sound(path)
-
-    def _open_calibrate(self) -> None:
-        """Open the OCR calibration dialog."""
-        from takumi_trader.ui.calibrate_dialog import CalibrateDialog
-        dlg = CalibrateDialog(parent=self)
-        dlg.exec()
-        # Update status label after calibration
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        w = s.value("ocr/region_width", 0, type=int)
-        h = s.value("ocr/region_height", 0, type=int)
-        if w > 0 and h > 0:
-            l = s.value("ocr/region_left", 0, type=int)
-            t = s.value("ocr/region_top", 0, type=int)
-            self._ocr_status.setText(f"Region: {w}x{h} at ({l}, {t})")
-        else:
-            self._ocr_status.setText("Not calibrated")
-
-    def _browse_csi_file(self) -> None:
-        """Open file dialog to select the CSI alert sound file."""
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select CSI Alert Sound",
-            "",
-            "Sound Files (*.wav *.mp3);;All Files (*)",
-        )
-        if path:
-            self.txt_csi_file.setText(path)
-
-    def _test_csi_sound(self) -> None:
-        """Play the currently selected CSI sound file."""
-        path = self.txt_csi_file.text()
         if path and os.path.isfile(path):
             play_sound(path)
 
@@ -479,9 +357,7 @@ class SettingsDialog(QDialog):
             "ctrader_client_secret": self._ct_inputs["ctrader_client_secret"].text(),
             "ctrader_access_token": self._ct_inputs["ctrader_access_token"].text(),
             "ctrader_account_id": self._ct_inputs["ctrader_account_id"].text(),
-            "ctrader_lot_size": 0.01,  # legacy, dynamic sizing used now
-            "ctrader_balance": self.spin_ct_balance.value(),
-            "ctrader_risk_pct": self.spin_ct_risk.value(),
+            "ctrader_lot_size": self.spin_ct_lot.value(),
             "ctrader_auto_open": self.chk_ct_auto_open.isChecked(),
             "ctrader_auto_close": self.chk_ct_auto_close.isChecked(),
             "ctrader_max_positions": self.spin_ct_max_pos.value(),
@@ -491,9 +367,4 @@ class SettingsDialog(QDialog):
             "mt5_auto_close": self.chk_mt5_auto_close.isChecked(),
             "mt5_risk_pct": self.spin_mt5_risk.value(),
             "mt5_max_positions": self.spin_mt5_max_pos.value(),
-            # CSI alerts
-            "csi_sound_file": self.txt_csi_file.text(),
-            "csi_sound_enabled": self.chk_csi_enabled.isChecked(),
-            "csi_cooldown_minutes": self.spin_csi_cooldown.value(),
-            "ocr_enabled": self.chk_ocr_enabled.isChecked(),
         }

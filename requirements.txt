@@ -7,3 +7,7 @@ pygame
 ctrader_open_api
 service_identity
 tzdata
+mss
+Pillow
+pytesseract
+pyarrow>=14.0.0
