@@ -274,6 +274,33 @@ def test_4_drift_banner_activation():
             _fail(f"dangerous body missing classification: {body_dang[-300:]!r}")
         _ok("dangerous classification in body text")
 
+        # Pessimistic-direction body should NOT commit to a specific
+        # tuning lever (slippage vs SL-first) — softened 2026-05-07.
+        # The rolling mean alone can't disambiguate; classification
+        # must say "investigate" with a decomposition pointer.
+        body_pess = panel._calibration_body.text()
+        time.sleep(1.05)
+        cal_path = Path(td) / "shadow_calibration_Sv2.json"
+        _write(cal_path, [
+            _make_calibration(written_at=4000.0 + i, delta=5.0)
+            for i in range(10)
+        ])
+        panel.refresh()
+        body_pess = panel._calibration_body.text()
+        # Must NOT name a specific lever
+        for forbidden in ("slippage-tunable", "SL-first dominant"):
+            if forbidden in body_pess:
+                _fail(
+                    f"pessimistic body should not commit to lever {forbidden!r} "
+                    f"(softened 2026-05-07): {body_pess[-300:]!r}"
+                )
+        # Must include "investigate" + decomposition guidance
+        if "investigate" not in body_pess or "decompose" not in body_pess:
+            _fail(
+                f"pessimistic body missing softened guidance: {body_pess[-300:]!r}"
+            )
+        _ok("softened: no lever-specific guidance, 'investigate' + decomposition pointer present")
+
 
 # ─────────────────────────────────────────────────────────────────────
 

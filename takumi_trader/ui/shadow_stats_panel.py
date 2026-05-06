@@ -739,17 +739,33 @@ class ShadowStatsPanel(QWidget):
 
     @staticmethod
     def _classify_rolling_mean(mean: float) -> str:
+        """Classify rolling-mean direction + magnitude WITHOUT committing
+        to a tuning lever (slippage vs SL-first).
+
+        Originally I committed to "slippage-tunable" at +3-7p and
+        "SL-first dominant" at +8-12p, but the rolling mean alone can't
+        distinguish those cases — a +6p mean could be a constant spread
+        baseline offset OR 50% of trades flipping +12p via SL-first OR
+        any mix. Lever choice requires bucketing by pair × duration,
+        which is decomposition work that lives in analysis scripts, not
+        in operational visibility. Softened 2026-05-07 per architect
+        review at Phase E close-out.
+        """
         if mean < -_CAL_BAND_PIPS:
             return "<b style='color:#c62828'>TOO OPTIMISTIC — DANGEROUS</b>"
         if abs(mean) <= _CAL_BAND_PIPS:
             return "<span style='color:#2e7d32'>within band &#10003;</span>"
-        # 1.5 < mean <= 7 = pessimistic-borderline; 7-12 = SL-first too aggressive;
-        # > 12 = investigate (per project_shadow_calibration_interpretation.md).
-        if mean <= 7.0:
-            return "<span style='color:#f57c00'>over-pessimistic, slippage-tunable</span>"
+        # All over-pessimistic cases — investigate via decomposition.
+        # Magnitude colorcoded but lever NOT named (would mislead).
         if mean <= 12.0:
-            return "<span style='color:#f57c00'>over-pessimistic, SL-first dominant</span>"
-        return "<b style='color:#c62828'>far over-pessimistic — investigate</b>"
+            return (
+                "<span style='color:#f57c00'>over-pessimistic — "
+                "investigate (decompose by pair × duration)</span>"
+            )
+        return (
+            "<b style='color:#c62828'>far over-pessimistic — "
+            "investigate (decompose by pair × duration)</b>"
+        )
 
     def _reset_calibration_header(self) -> None:
         self._calibration_header.setText("─── Recent Calibrations ───")
