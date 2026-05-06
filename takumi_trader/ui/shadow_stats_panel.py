@@ -6,9 +6,9 @@ gate distribution, recent calibrations, and worker health without
 grepping logs or reading JSON files.
 
 E.1 shipped Section 1 (Today's Capture).
-E.2 adds Section 2 (Today's Gate Distribution) + Section 3 (Recent
+E.2 added Section 2 (Today's Gate Distribution) + Section 3 (Recent
     Calibrations with rolling-10 mean activation at n=10).
-E.3 will add section 4 (worker health + heartbeat).
+E.3 adds Section 4 (Worker Health + heartbeat-staleness detection).
 E.4 integrates the panel into PerformanceDialog's Sv2 tab.
 
 Architectural principles (per the Phase E spec):
@@ -82,6 +82,14 @@ _CAL_BAND_PIPS = 1.5            # drift detector warns at ±this
 _CAL_BORDERLINE_PIPS = 3.0      # |delta| > this is "borderline" per architect
 _CAL_ALARM_PIPS = 15.0          # |delta| > this is "investigate" per architect
 _ROLLING_WINDOW = 10            # drift detector activation threshold
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Worker heartbeat staleness — if no cycle_complete in this many seconds,
+# something is wrong (poll_interval=300s, so 600s = two missed cycles).
+# ─────────────────────────────────────────────────────────────────────
+
+_HEARTBEAT_STALE_SECONDS = 600.0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -165,7 +173,9 @@ class ShadowStatsPanel(QWidget):
         self._calibration_section = self._build_calibration_section()
         layout.addWidget(self._calibration_section)
 
-        # E.3 will add: worker health
+        self._worker_section = self._build_worker_section()
+        layout.addWidget(self._worker_section)
+
         layout.addStretch(1)
 
     def _build_capture_section(self) -> QFrame:
@@ -226,6 +236,37 @@ class ShadowStatsPanel(QWidget):
         v.addWidget(self._gate_body)
         return frame
 
+    def _build_worker_section(self) -> QFrame:
+        """Section 4: Worker health (state, pending counts, heartbeat).
+
+        Frame style mutates between healthy / stale heartbeat states
+        (red border when stale)."""
+        frame = QFrame()
+        frame.setObjectName("worker_section")
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self._worker_frame_default_style = (
+            "QFrame#worker_section { background: #f7f7f7; "
+            "border: 1px solid #ddd; border-radius: 4px; padding: 4px; }"
+        )
+        frame.setStyleSheet(self._worker_frame_default_style)
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(6, 4, 6, 4)
+        v.setSpacing(2)
+
+        self._worker_header = QLabel("─── Worker Health ───")
+        self._worker_header.setStyleSheet("font-weight: bold; color: #444;")
+        v.addWidget(self._worker_header)
+
+        self._worker_body = QLabel("(loading…)")
+        self._worker_body.setTextFormat(Qt.TextFormat.RichText)
+        self._worker_body.setStyleSheet(
+            "font-family: 'Consolas', 'Courier New', monospace; "
+            "font-size: 10pt; color: #222;"
+        )
+        self._worker_body.setWordWrap(True)
+        v.addWidget(self._worker_body)
+        return frame
+
     def _build_calibration_section(self) -> QFrame:
         """Section 3: Recent calibrations + rolling-10 mean activation
         at n=10. The frame's stylesheet header is mutated by the drift
@@ -284,6 +325,11 @@ class ShadowStatsPanel(QWidget):
         except Exception as exc:
             logger.warning("[SHADOW PANEL] calibration section refresh raised: %s", exc)
             self._calibration_body.setText("(refresh error — see logs)")
+        try:
+            self._render_worker_section()
+        except Exception as exc:
+            logger.warning("[SHADOW PANEL] worker section refresh raised: %s", exc)
+            self._worker_body.setText("(refresh error — see logs)")
 
     # ── Disk read with mtime caching ────────────────────────────────
 
@@ -726,6 +772,127 @@ class ShadowStatsPanel(QWidget):
             "QFrame#calibration_section { background: #fff3e0; "
             "border: 2px solid #f57c00; border-radius: 4px; padding: 4px; }"
         )
+
+    # ── Section 4: Worker Health ────────────────────────────────────
+
+    def _render_worker_section(self) -> None:
+        """Worker state, pending queues, last cycle, heartbeat health."""
+        if self.sim_worker is None:
+            self._worker_body.setText(
+                "<i>Worker not wired (panel running standalone or worker "
+                "failed to construct).</i>"
+            )
+            self._reset_worker_header()
+            return
+
+        try:
+            stats = self.sim_worker.get_stats()
+        except Exception as exc:
+            logger.warning("[SHADOW PANEL] get_stats raised: %s", exc)
+            self._worker_body.setText(
+                "<i>Worker unreachable (get_stats raised).</i>"
+            )
+            self._set_worker_header_stale()
+            return
+
+        last_ts = float(stats.get("last_cycle_complete_ts", 0.0) or 0.0)
+        cycles = int(stats.get("cycles_completed", 0) or 0)
+        first_run = bool(stats.get("first_run_active", False))
+        pending_sim = int(stats.get("pending_count", -1))
+        sims_total = int(stats.get("total_records_simulated", 0) or 0)
+        cals_total = int(stats.get("total_calibrations_written", 0) or 0)
+        permanents_total = int(stats.get("total_permanent_failed", 0) or 0)
+
+        # pending_calibration count: derive from journal cache.
+        # An EXECUTED record with sim_completed=True but
+        # calibration_completed=False is awaiting calibration.
+        pending_cal = 0
+        for r in self._journal_cache:
+            if not isinstance(r, dict):
+                continue
+            if r.get("status", "") != "EXECUTED":
+                continue
+            if not r.get("sim_completed", False):
+                continue
+            if r.get("calibration_completed", False):
+                continue
+            pending_cal += 1
+
+        # Heartbeat: if last_cycle_complete_ts is 0, worker hasn't
+        # finished its first cycle yet (still warming up). Otherwise,
+        # check if it's gone stale beyond _HEARTBEAT_STALE_SECONDS.
+        now = time.time()
+        if last_ts <= 0.0:
+            heartbeat_status = (
+                "<i>Warming up — first cycle has not yet completed.</i>"
+            )
+            stale = False
+        else:
+            age_sec = now - last_ts
+            stale = age_sec > _HEARTBEAT_STALE_SECONDS
+            if stale:
+                heartbeat_status = (
+                    f"<b style='color:#c62828'>&#9888; HEARTBEAT STALE &mdash; "
+                    f"last cycle {self._format_age(age_sec)} ago</b><br>"
+                    f"&nbsp;&nbsp;Worker may be hung or M1 cache unreachable."
+                )
+            else:
+                heartbeat_status = (
+                    f"<span style='color:#2e7d32'>&#10003; healthy</span> "
+                    f"&mdash; last cycle {self._format_age(age_sec)} ago"
+                )
+
+        if stale:
+            self._set_worker_header_stale()
+        else:
+            self._reset_worker_header()
+
+        # State line
+        if first_run:
+            state_line = (
+                "FIRST-RUN &mdash; clearing permanent backlog "
+                f"(cycle {cycles}, ~{permanents_total:,} marked so far)"
+            )
+        else:
+            state_line = "STEADY"
+
+        rows = [
+            f"&nbsp;&nbsp;State: <b>{state_line}</b>",
+            f"&nbsp;&nbsp;Pending simulations: {pending_sim}",
+            f"&nbsp;&nbsp;Pending calibrations: {pending_cal}",
+            f"&nbsp;&nbsp;Cycles completed: {cycles}",
+            f"&nbsp;&nbsp;Total simulated: {sims_total:,} &nbsp; "
+            f"calibrations: {cals_total:,} &nbsp; "
+            f"permanent-failed: {permanents_total:,}",
+            f"&nbsp;&nbsp;Heartbeat: {heartbeat_status}",
+        ]
+        drift = stats.get("current_drift_warning", None)
+        if drift:
+            rows.append(
+                "&nbsp;&nbsp;<b style='color:#c62828'>"
+                f"Drift warning active:</b> {drift}"
+            )
+        self._worker_body.setText("<br>".join(rows))
+
+    def _reset_worker_header(self) -> None:
+        self._worker_header.setText("─── Worker Health ───")
+        self._worker_section.setStyleSheet(self._worker_frame_default_style)
+
+    def _set_worker_header_stale(self) -> None:
+        self._worker_header.setText("─── ⚠ Worker Health (HEARTBEAT STALE) ───")
+        self._worker_section.setStyleSheet(
+            "QFrame#worker_section { background: #ffebee; "
+            "border: 2px solid #c62828; border-radius: 4px; padding: 4px; }"
+        )
+
+    @staticmethod
+    def _format_age(seconds: float) -> str:
+        if seconds < 60.0:
+            return f"{int(seconds)}s"
+        if seconds < 3600.0:
+            return f"{int(seconds / 60)}m {int(seconds) % 60}s"
+        hours = seconds / 3600.0
+        return f"{hours:.1f}h"
 
     # ── Formatting helpers ──────────────────────────────────────────
 
