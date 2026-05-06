@@ -6234,6 +6234,12 @@ class MainWindow(QMainWindow):
             # bar for side-by-side comparison.
             sv2_upgraded_trades_file=_DATA_DIR / "paper_trades_sv2_upgraded.json",
             sv2_upgraded_paper_trader=getattr(self, '_paper_trader_sv2_upgraded', None),
+            # Phase E (2026-05-06) — shadow stats panel embedded in Sv2 tab.
+            # Sourced from the same paths the worker uses; sim_worker may be
+            # None if it failed to construct in main_window's startup block.
+            shadow_journal_path=_DATA_DIR / "shadow_trades_Sv2.json",
+            shadow_calibration_path=_DATA_DIR / "shadow_calibration_Sv2.json",
+            shadow_sim_worker=getattr(self, "_shadow_sim_worker", None),
         )
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         # Center on primary monitor

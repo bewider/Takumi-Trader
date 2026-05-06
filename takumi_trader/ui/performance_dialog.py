@@ -932,6 +932,13 @@ class PerformanceDialog(QWidget):
         au5_trades_file: Path | None = None,
         au5_paper_trader=None,
         include_standard_tabs: bool = True,
+        # Phase E (2026-05-06): shadow stats panel embedded in Sv2 tab.
+        # All four are optional — panel is only built if shadow_journal
+        # is provided. shadow_sim_worker can be None if worker failed
+        # to start; panel runs in standalone mode.
+        shadow_journal_path: Path | None = None,
+        shadow_calibration_path: Path | None = None,
+        shadow_sim_worker=None,
     ) -> None:
         # No parent → independent top-level window (not pinned with main)
         super().__init__(None)
@@ -940,6 +947,11 @@ class PerformanceDialog(QWidget):
         self._paper_trades_file = paper_trades_file
         self._csi_log_file = csi_log_file
         self._paper_trader = paper_trader
+        # Phase E shadow-panel deps (stored for use in _build_ui Sv2 tab)
+        self._shadow_journal_path = shadow_journal_path
+        self._shadow_calibration_path = shadow_calibration_path
+        self._shadow_sim_worker = shadow_sim_worker
+        self._sv2_shadow_panel = None  # built in Sv2 tab if deps present
         self._ss_trades_file = ss_trades_file
         self._ss_paper_trader = ss_paper_trader
         self._ss_records: list[PaperTradeRecord] = []
@@ -1428,6 +1440,33 @@ class PerformanceDialog(QWidget):
         )
 
         self._paper_v_splitter.addWidget(table_container)
+
+        # Phase E (2026-05-06): shadow stats panel as third splitter
+        # pane below the trade table. Built only if the host (main_window)
+        # provided shadow paths; defensive try/except so a panel-construction
+        # failure can't take down the dialog.
+        if self._shadow_journal_path is not None:
+            try:
+                from takumi_trader.ui.shadow_stats_panel import ShadowStatsPanel
+                self._sv2_shadow_panel = ShadowStatsPanel(
+                    shadow_journal_path=self._shadow_journal_path,
+                    calibration_log_path=self._shadow_calibration_path,
+                    sim_worker=self._shadow_sim_worker,
+                    paper_journal_path=self._paper_trades_file,
+                    parent=paper_page,
+                )
+                self._paper_v_splitter.addWidget(self._sv2_shadow_panel)
+                self._paper_v_splitter.setStretchFactor(2, 3)
+            except Exception as exc:
+                # Logging via standard library (PerformanceDialog
+                # already uses the project logger pattern elsewhere)
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "Failed to build ShadowStatsPanel for Sv2 tab: %s", exc,
+                    exc_info=True,
+                )
+                self._sv2_shadow_panel = None
+
         self._paper_v_splitter.setStretchFactor(0, 4)
         self._paper_v_splitter.setStretchFactor(1, 6)
 
