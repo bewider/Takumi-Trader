@@ -274,12 +274,18 @@ def test_5_schema_evolution_on_production_journal():
     if len(recs) == 0:
         _fail("production journal loaded zero records — unexpected")
 
-    # Every loaded record must have transient_retry_count = 0 (the default)
-    # because no record on disk was written with the field present yet.
-    nonzero = [r for r in recs if r.transient_retry_count != 0]
-    if nonzero:
-        _fail(f"{len(nonzero)} records loaded with non-zero transient_retry_count "
-              "(expected all 0 — field is brand new)")
+    # Every loaded record must have a valid (int, >=0) transient_retry_count.
+    # On first-light all records had 0 (default for the brand-new field);
+    # after the worker runs in production some records may have been
+    # bumped on transient failures. Both states are valid — what we
+    # verify here is that the schema extension parses cleanly.
+    bad_type = [r for r in recs if not isinstance(r.transient_retry_count, int)]
+    if bad_type:
+        _fail(f"{len(bad_type)} records have non-int transient_retry_count")
+    negative = [r for r in recs if r.transient_retry_count < 0]
+    if negative:
+        _fail(f"{len(negative)} records have negative transient_retry_count")
+    n_bumped = sum(1 for r in recs if r.transient_retry_count > 0)
 
     # Phase A's malformed check: every record must have valid identity
     malformed = [r for r in recs if r.shadow_id == 0 or r.signal_time == 0]
@@ -289,7 +295,8 @@ def test_5_schema_evolution_on_production_journal():
     _ok(
         f"loaded {len(recs):,} records in {load_dt_ms:.0f}ms "
         f"({len(recs) / (load_dt_ms / 1000):.0f} rec/s), "
-        f"all with transient_retry_count=0, zero malformed"
+        f"transient_retry_count valid for all ({n_bumped} bumped, "
+        f"{len(recs) - n_bumped} default), zero malformed"
     )
 
 
