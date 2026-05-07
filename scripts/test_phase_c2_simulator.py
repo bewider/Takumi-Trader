@@ -339,6 +339,157 @@ def test_6_session_spread_asymmetry():
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Fix A (2026-05-07) — stale_proposed_levels guard
+# ─────────────────────────────────────────────────────────────────────
+
+def test_7_stale_levels_guard_sell_overshoot():
+    """SELL signal: bars[0] price drifts up 10p between signal_time and
+    bars[0], so WCF→LOW lands sim_entry ABOVE proposed SL. Guard must
+    fire and return FAILED('stale_proposed_levels')."""
+    print("\n[7] stale-levels guard fires on SELL with sim_entry > SL_price")
+    signal_time = datetime(2026, 4, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+    # Proposed: sell at 1.0500, SL 1.0510 (10p above), TP 1.0480 (20p below).
+    # bars[0] LOW = 1.0512 (already past proposed SL by 2p).
+    # WCF for SELL takes LOW=1.0512, then -spread-slip → ~1.05116.
+    # sim_entry 1.0512 > SL 1.0510 → guard fires.
+    def gen(pair, s, e):
+        return _make_bars(signal_time, [
+            (1.0515, 1.0518, 1.0512, 1.0516),  # entry candle, all above proposed SL
+            (1.0516, 1.0520, 1.0510, 1.0512),
+        ])
+
+    sim = _build_simulator(gen)
+    rec = _make_record(direction="SELL", signal_time=signal_time.timestamp(),
+                       entry=1.0500, sl=1.0510, tp=1.0480)
+    out = sim.simulate(rec)
+
+    if out.sim_exit_reason != "FAILED":
+        _fail(f"expected FAILED, got {out.sim_exit_reason} pnl={out.sim_pnl_pips}")
+    if out.sim_failure_reason != "stale_proposed_levels":
+        _fail(f"failure_reason: expected 'stale_proposed_levels', got {out.sim_failure_reason!r}")
+    _ok("SELL with sim_entry > SL_price -> FAILED(stale_proposed_levels)")
+
+
+def test_8_stale_levels_guard_buy_overshoot():
+    """Symmetric BUY case: bars[0] LOW puts sim_entry below proposed SL."""
+    print("\n[8] stale-levels guard fires on BUY with sim_entry < SL_price")
+    signal_time = datetime(2026, 4, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+    # Proposed: buy at 1.0500, SL 1.0490 (10p below), TP 1.0520 (20p above).
+    # bars[0] HIGH = 1.0488 (below proposed SL).
+    # WCF for BUY takes HIGH=1.0488, then +spread+slip → ~1.04884.
+    # sim_entry 1.04884 < SL 1.0490 → guard fires.
+    def gen(pair, s, e):
+        return _make_bars(signal_time, [
+            (1.0485, 1.0488, 1.0482, 1.0486),
+            (1.0486, 1.0490, 1.0480, 1.0488),
+        ])
+
+    sim = _build_simulator(gen)
+    rec = _make_record(direction="BUY", signal_time=signal_time.timestamp(),
+                       entry=1.0500, sl=1.0490, tp=1.0520)
+    out = sim.simulate(rec)
+
+    if out.sim_exit_reason != "FAILED":
+        _fail(f"expected FAILED, got {out.sim_exit_reason} pnl={out.sim_pnl_pips}")
+    if out.sim_failure_reason != "stale_proposed_levels":
+        _fail(f"failure_reason: expected 'stale_proposed_levels', got {out.sim_failure_reason!r}")
+    _ok("BUY with sim_entry < SL_price -> FAILED(stale_proposed_levels)")
+
+
+def test_9_stale_levels_guard_tp_overshoot():
+    """SELL where bars[0] drifted DOWN below proposed TP: sim_entry below TP, guard fires."""
+    print("\n[9] stale-levels guard fires on SELL with sim_entry below TP_price")
+    signal_time = datetime(2026, 4, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+    # Proposed: sell at 1.0500, SL 1.0510, TP 1.0480.
+    # bars[0] LOW = 1.0475 (below proposed TP 1.0480).
+    # WCF for SELL takes LOW=1.0475, sim_entry < TP → guard fires.
+    def gen(pair, s, e):
+        return _make_bars(signal_time, [
+            (1.0478, 1.0480, 1.0475, 1.0476),
+            (1.0476, 1.0480, 1.0470, 1.0473),
+        ])
+
+    sim = _build_simulator(gen)
+    rec = _make_record(direction="SELL", signal_time=signal_time.timestamp(),
+                       entry=1.0500, sl=1.0510, tp=1.0480)
+    out = sim.simulate(rec)
+
+    if out.sim_exit_reason != "FAILED":
+        _fail(f"expected FAILED, got {out.sim_exit_reason}")
+    if out.sim_failure_reason != "stale_proposed_levels":
+        _fail(f"failure_reason: {out.sim_failure_reason!r}")
+    _ok("SELL with sim_entry < TP_price -> FAILED(stale_proposed_levels)")
+
+
+def test_10_normal_sell_passes_guard():
+    """Regression: a normal SELL where sim_entry stays between SL and TP
+    must NOT fire the guard. This catches false-positive guard fires."""
+    print("\n[10] normal SELL with sim_entry between SL and TP passes guard")
+    signal_time = datetime(2026, 4, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+    # Proposed: sell at 1.0500, SL 1.0520, TP 1.0460.
+    # bars[0] LOW = 1.0498 (within range).
+    # sim_entry ~1.04976 → between TP 1.0460 and SL 1.0520. Guard does NOT fire.
+    def gen(pair, s, e):
+        return _make_bars(signal_time, [
+            (1.0500, 1.0502, 1.0498, 1.0500),  # entry candle
+            (1.0500, 1.0510, 1.0500, 1.0508),
+            (1.0508, 1.0521, 1.0507, 1.0518),  # SL hit on bar 2
+        ])
+
+    sim = _build_simulator(gen)
+    rec = _make_record(direction="SELL", signal_time=signal_time.timestamp(),
+                       entry=1.0500, sl=1.0520, tp=1.0460)
+    out = sim.simulate(rec)
+
+    if out.sim_exit_reason == "FAILED" and out.sim_failure_reason == "stale_proposed_levels":
+        _fail("guard FALSE-POSITIVE on normal SELL — should NOT fire")
+    if out.sim_exit_reason != "SL":
+        _fail(f"expected SL exit, got {out.sim_exit_reason}")
+    _ok("normal SELL passes guard cleanly, hits SL as expected")
+
+
+def test_11_normal_buy_passes_guard():
+    """Regression: a normal BUY where sim_entry stays between SL and TP."""
+    print("\n[11] normal BUY with sim_entry between SL and TP passes guard")
+    signal_time = datetime(2026, 4, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+    def gen(pair, s, e):
+        return _make_bars(signal_time, [
+            (1.0498, 1.0502, 1.0497, 1.0500),  # entry candle
+            (1.0500, 1.0510, 1.0498, 1.0508),
+            (1.0508, 1.0530, 1.0505, 1.0528),
+            (1.0528, 1.0541, 1.0525, 1.0540),  # TP hit
+        ])
+
+    sim = _build_simulator(gen)
+    rec = _make_record(direction="BUY", signal_time=signal_time.timestamp(),
+                       entry=1.0500, sl=1.0480, tp=1.0540)
+    out = sim.simulate(rec)
+
+    if out.sim_exit_reason == "FAILED" and out.sim_failure_reason == "stale_proposed_levels":
+        _fail("guard FALSE-POSITIVE on normal BUY — should NOT fire")
+    if out.sim_exit_reason != "TP":
+        _fail(f"expected TP exit, got {out.sim_exit_reason}")
+    _ok("normal BUY passes guard cleanly, hits TP as expected")
+
+
+def test_12_stale_levels_classified_permanent_in_worker():
+    """Worker's _is_transient_failure_reason must classify
+    'stale_proposed_levels' as PERMANENT, not transient. Otherwise
+    records would be retried 12 times with no possibility of
+    success (same failure mode as the empty_m1 bug)."""
+    print("\n[12] worker classifies stale_proposed_levels as PERMANENT (no retry)")
+    from takumi_trader.core.shadow_sim_worker import _is_transient_failure_reason
+    if _is_transient_failure_reason("stale_proposed_levels"):
+        _fail("stale_proposed_levels classified as transient — would retry 12 times wastefully")
+    _ok("stale_proposed_levels classified as permanent (no retry budget)")
+
+
 # ── Bonus: real strength-pass dry-run from yesterday's journal ─────
 
 def diagnostic_real_record():
@@ -402,6 +553,13 @@ if __name__ == "__main__":
     test_4_timeout()
     test_5_failed_no_m1_data()
     test_6_session_spread_asymmetry()
+    # Fix A (2026-05-07) — stale_proposed_levels guard
+    test_7_stale_levels_guard_sell_overshoot()
+    test_8_stale_levels_guard_buy_overshoot()
+    test_9_stale_levels_guard_tp_overshoot()
+    test_10_normal_sell_passes_guard()
+    test_11_normal_buy_passes_guard()
+    test_12_stale_levels_classified_permanent_in_worker()
 
     diagnostic_real_record()
 

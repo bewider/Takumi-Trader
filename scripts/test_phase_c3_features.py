@@ -188,13 +188,19 @@ def test_5_simulate_populates_features_on_success():
     signal_time = datetime(2026, 4, 15, 14, 0, 0, tzinfo=timezone.utc)
 
     # Generator returns lookback bars (24h before signal_time)
-    # AND forward bars (signal_time + max_hold)
+    # AND forward bars (signal_time + max_hold). The walk MUST be
+    # anchored to signal_time so price at bars[0] is near
+    # proposed_entry — otherwise the 720-minute fetch padding
+    # drifts the walk far enough that the Fix A stale_proposed_levels
+    # guard fires (added 2026-05-07 in shadow_simulator.py).
     def gen(pair, start_dt, end_dt):
-        # Compute total minutes in the window and produce bars covering it
         n_min = int((end_dt - start_dt).total_seconds() // 60)
         if n_min <= 0:
             return np.empty(0, dtype=_M1_DTYPE)
-        return _make_walk(start_dt, n_min)
+        minutes_to_signal = max(0, int((signal_time - start_dt).total_seconds() // 60))
+        # Walk price at signal_time minute equals 1.1000 (proposed_entry)
+        base_price = 1.1000 - minutes_to_signal * 0.0001
+        return _make_walk(start_dt, n_min, base_price=base_price)
 
     cfg = ShadowSimulatorConfig()
     cache = M1Cache(Path(tempfile.mkdtemp()), mt5_module=FakeMT5(gen))

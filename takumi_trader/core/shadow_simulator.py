@@ -291,6 +291,36 @@ class ShadowSimulator:
             pip=pip,
         )
 
+        # ── Step 4.5: stale-proposed-levels guard (2026-05-07 fix) ─
+        # The pessimistic-entry mechanism assumes sim_entry stays on the
+        # "correct side" of the proposed SL/TP levels. When there's
+        # significant price movement between signal_time and bars[0]
+        # (typically Asia-Pacific session pairs with high per-bar
+        # range), entry slippage can push sim_entry past one of the
+        # proposed levels. In that state the trade's R:R framing is
+        # broken: SL/TP are no longer in the directions they were
+        # designed to monitor, and producing pnl yields structurally-
+        # impossible outcomes (e.g., SL hit at profit).
+        #
+        # Fail-fast with reason "stale_proposed_levels" so the worker
+        # marks the record permanent-FAILED rather than retrying 12x
+        # (the failure reason is added to _PERMANENT_FAILURE_PREFIXES
+        # in shadow_sim_worker.py). Edge Miner queries can identify
+        # and exclude these records by reason.
+        #
+        # Diagnosed via Tier 1 due-diligence on calibration entry
+        # shadow_id=29686 EURCHF SELL: proposed_entry=0.91555, sl=0.91604,
+        # but bars[0] LOW=0.91638 → sim_entry=0.9163 (8p past proposed).
+        # Blast radius scan: 210 of 60,359 records (0.35%) hit this
+        # before the guard, dominated by Asia-Pacific SELL signals.
+        # Fix B (root-cause bar-alignment) deferred to a future session.
+        if record.direction == "BUY":
+            if sim_entry <= record.proposed_sl_price or sim_entry >= record.proposed_tp_price:
+                return self._failed("stale_proposed_levels")
+        else:  # SELL
+            if sim_entry >= record.proposed_sl_price or sim_entry <= record.proposed_tp_price:
+                return self._failed("stale_proposed_levels")
+
         # ── Step 5: SL/TP stay at proposed PRICES (Decision (a)) ─────
         # The broker would have placed SL/TP at these levels regardless
         # of where we got filled. Pessimistic entry naturally degrades

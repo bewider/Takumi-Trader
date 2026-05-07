@@ -643,6 +643,11 @@ _PERMANENT_FAILURE_PREFIXES: tuple[str, ...] = (
     "invalid_proposal_prices",
     "invalid_direction",
     "insufficient_m1_bars",
+    # 2026-05-07: pessimistic entry overshot proposed SL/TP levels.
+    # Retrying won't help — the proposed levels are statically wrong
+    # relative to where price went between signal_time and bars[0].
+    # Mark permanent-FAILED on first occurrence, no retry budget.
+    "stale_proposed_levels",
 )
 
 
