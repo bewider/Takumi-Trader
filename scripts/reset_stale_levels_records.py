@@ -33,6 +33,15 @@ Run:
 
     # Execute (writes backups, then mutates)
     python scripts/reset_stale_levels_records.py --execute
+
+    # Execute + dedupe calibration log (added 2026-05-07 for the
+    # persistence-timing bug that causes duplicate cal entries)
+    python scripts/reset_stale_levels_records.py --execute --dedupe-cal
+
+IMPORTANT: TAKUMI must be FULLY STOPPED (process not running, not just
+MT5-disconnected) before running with --execute. The worker's
+in-memory state will overwrite this script's disk cleanup if it
+flushes after the script runs. See project_persistence_timing_bug.md.
 """
 from __future__ import annotations
 
@@ -173,12 +182,60 @@ def reset_calibration(cal_path: Path, dry_run: bool) -> tuple[int, list[int]]:
     return len(affected_ids), affected_ids
 
 
+def dedupe_calibration(cal_path: Path, dry_run: bool) -> tuple[int, list[int]]:
+    """Remove duplicate calibration entries.
+
+    Calibration is a single event per (shadow_id, signal_time) —
+    one calibration per executed shadow record's real-trade close.
+    The persistence-timing bug (project_persistence_timing_bug.md)
+    can produce a second cal entry with a LATER written_at when
+    shutdown hits between cal_log.append() and the delayed journal
+    mark_calibration_completed flush; on restart the worker re-finds
+    the un-flagged record in pending_calibration and writes it again.
+
+    Dedupe key is (shadow_id, signal_time) — written_at WILL differ
+    between the original and post-restart writes, so it's NOT in
+    the key.
+
+    Keeps the FIRST occurrence (lowest written_at) in original order;
+    drops subsequent duplicates. Returns (n_removed, dup_shadow_ids).
+    """
+    if not cal_path.exists():
+        return 0, []
+    data = json.loads(cal_path.read_text(encoding="utf-8"))
+    # Sort by written_at ascending so "first occurrence" = oldest write.
+    sorted_data = sorted(
+        data, key=lambda e: float(e.get("written_at", 0.0)) if isinstance(e, dict) else 0.0
+    )
+    seen: set[tuple] = set()
+    keep: list[dict] = []
+    dup_ids: list[int] = []
+    for entry in sorted_data:
+        if not isinstance(entry, dict):
+            keep.append(entry)
+            continue
+        key = (entry.get("shadow_id", 0), entry.get("signal_time", 0.0))
+        if key in seen:
+            dup_ids.append(entry.get("shadow_id", 0))
+            continue
+        seen.add(key)
+        keep.append(entry)
+    if not dry_run:
+        atomic_json_write(cal_path, keep)
+    return len(dup_ids), dup_ids
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--journal", default="data/shadow_trades_Sv2.json")
     p.add_argument("--calibration", default="data/shadow_calibration_Sv2.json")
     p.add_argument("--execute", action="store_true",
                    help="Actually mutate files. Without this, dry-run only.")
+    p.add_argument("--dedupe-cal", action="store_true",
+                   help="Also dedupe the calibration log by (shadow_id, "
+                        "written_at, delta_pips) — added 2026-05-07 to "
+                        "address duplicate entries from the persistence-"
+                        "timing bug (see project_persistence_timing_bug.md).")
     args = p.parse_args(argv)
 
     journal_path = Path(args.journal)
@@ -236,6 +293,18 @@ def main(argv: list[str] | None = None) -> int:
     if cal_ids:
         print(f"    affected shadow_ids: {cal_ids}")
 
+    n_dup, dup_ids = (0, [])
+    if args.dedupe_cal:
+        # Dedupe scan runs AFTER bug-pattern reset would remove its entries,
+        # so simulate that by taking the cal log minus the bug-pattern entries.
+        # Easiest: dry-run the dedupe directly on disk; the order of
+        # operations in execute mode is reset_cal first, then dedupe.
+        n_dup, dup_ids = dedupe_calibration(cal_path, dry_run=True)
+        print(f"  Step 3b: scanning calibration for duplicate entries ...")
+        print(f"    {n_dup} duplicate calibration entries (by shadow_id + signal_time)")
+        if dup_ids:
+            print(f"    duplicate shadow_ids: {dup_ids}")
+
     if not args.execute:
         print("\n  DRY-RUN complete — no files modified.")
         print("  Pass --execute to backup + reset.")
@@ -249,6 +318,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Step 5: executing calibration reset ...")
     n_cal_removed, _ = reset_calibration(cal_path, dry_run=False)
     print(f"    removed {n_cal_removed} calibration entries")
+
+    n_dup_removed = 0
+    if args.dedupe_cal:
+        print(f"  Step 5b: executing calibration dedupe ...")
+        n_dup_removed, _ = dedupe_calibration(cal_path, dry_run=False)
+        print(f"    removed {n_dup_removed} duplicate calibration entries")
 
     # Step 6: post-mutation verification
     print(f"\n  Step 6: post-mutation verification ...")
@@ -265,10 +340,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"    ✓ calibration: 0 bug entries remain (was {n_cal_removed})")
 
+    if args.dedupe_cal:
+        n_dup_post, _ = dedupe_calibration(cal_path, dry_run=True)
+        if n_dup_post != 0:
+            print(f"    ⚠ post-dedupe still has {n_dup_post} duplicate entries")
+            return 1
+        print(f"    ✓ calibration: 0 duplicate entries remain (was {n_dup_removed})")
+
     print("\n" + "=" * 67)
     print(f"  RESET COMPLETE")
-    print(f"  Journal records reset:      {n_reset_actual}")
-    print(f"  Calibration entries removed: {n_cal_removed}")
+    print(f"  Journal records reset:        {n_reset_actual}")
+    print(f"  Calibration bug entries removed: {n_cal_removed}")
+    if args.dedupe_cal:
+        print(f"  Calibration duplicates removed:  {n_dup_removed}")
     print(f"  Backups: data/*.pre_reset_{stamp}.bak")
     print(f"  Worker will re-simulate the {n_reset_actual} records on next cycles;")
     print(f"  with Fix A's guard active, they should now classify as")

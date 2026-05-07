@@ -31,6 +31,33 @@ from takumi_trader.analytics.shadow_loader import (  # noqa: E402
 )
 
 
+def _dedupe_calibrations(cals: list[CalibrationRecord]) -> tuple[list[CalibrationRecord], int]:
+    """Defensive read-time dedupe by (shadow_id, signal_time).
+
+    The persistence-timing bug (project_persistence_timing_bug.md) can
+    produce duplicate calibration entries when shutdown hits between
+    cal_log.append() and the delayed mark_calibration_completed flush.
+    Reset-script dedupe (--dedupe-cal) handles this on disk; this
+    function adds belt-and-suspenders at read-time so analytics stay
+    correct even if the disk cleanup hasn't run yet.
+
+    Keeps the FIRST occurrence by written_at ascending (oldest write).
+    Returns (deduped_list, n_duplicates_removed).
+    """
+    sorted_cals = sorted(cals, key=lambda c: float(c.written_at))
+    seen: set[tuple] = set()
+    out: list[CalibrationRecord] = []
+    n_dup = 0
+    for c in sorted_cals:
+        key = (int(c.shadow_id), float(c.signal_time))
+        if key in seen:
+            n_dup += 1
+            continue
+        seen.add(key)
+        out.append(c)
+    return out, n_dup
+
+
 def _short_exit(reason: str) -> str:
     m = {
         "tp_hit": "TP", "sl_hit": "SL",
@@ -343,6 +370,8 @@ def _section_milestones(cals: list[CalibrationRecord]) -> list[str]:
 
 def build_report(cals: list[CalibrationRecord], log_name: str) -> str:
     bar = "=" * 67
+    # Defensive read-time dedupe — see _dedupe_calibrations docstring.
+    cals, n_dup = _dedupe_calibrations(cals)
     if cals:
         first_dt = cals[0].signal_dt
         last_dt = cals[-1].signal_dt
@@ -355,8 +384,15 @@ def build_report(cals: list[CalibrationRecord], log_name: str) -> str:
         f"  Log:           {log_name}",
         f"  Total entries: {len(cals)}",
         f"  Window:        {window}",
-        bar,
     ]
+    if n_dup > 0:
+        header.append(
+            f"  WARNING:       {n_dup} duplicate cal entries deduped at read-time."
+        )
+        header.append(
+            f"                 Run reset_stale_levels_records.py --dedupe-cal to fix on disk."
+        )
+    header.append(bar)
     sections = [
         *_section_rolling_deltas(cals),
         *_section_exit_patterns(cals),

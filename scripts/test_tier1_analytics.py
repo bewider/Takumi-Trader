@@ -238,6 +238,40 @@ def test_4_calibration_trend():
     _ok("rolling-10 mean = +3.25p; decomposition by pair-category populated")
 
 
+def test_4b_calibration_dedupe_at_read():
+    """Defensive dedupe: duplicate cal entries by (shadow_id, signal_time)
+    are dropped at read-time, with the WARNING surfaced in the header."""
+    print("\n[4b] analyze_calibration_trend dedupes duplicates with warning")
+    from takumi_trader.analytics.analyze_calibration_trend import build_report
+    # 3 unique entries plus 2 duplicates (same shadow_id+signal_time, different written_at)
+    cals = [
+        _make_cal(shadow_id=1, signal_time=1000.0, written_at=100.0,
+                  delta_pips=2.0, pair="EURUSD"),
+        _make_cal(shadow_id=2, signal_time=2000.0, written_at=200.0,
+                  delta_pips=4.0, pair="GBPJPY"),
+        _make_cal(shadow_id=3, signal_time=3000.0, written_at=300.0,
+                  delta_pips=6.0, pair="NZDJPY"),
+        # Duplicate of shadow_id=1 with different written_at
+        _make_cal(shadow_id=1, signal_time=1000.0, written_at=400.0,
+                  delta_pips=2.0, pair="EURUSD"),
+        # Duplicate of shadow_id=2 with different written_at
+        _make_cal(shadow_id=2, signal_time=2000.0, written_at=500.0,
+                  delta_pips=4.0, pair="GBPJPY"),
+    ]
+    wrapped = [CalibrationRecord(c) for c in cals]
+    report = build_report(wrapped, "synthetic_dup_cal")
+
+    # After dedupe: 3 unique entries, 2 duplicates removed
+    if "Total entries: 3" not in report:
+        _fail(f"expected dedupe to leave 3 entries, got: {report[:500]!r}")
+    if "2 duplicate" not in report or "deduped" not in report:
+        _fail(f"WARNING about duplicates not surfaced: {report[:500]!r}")
+    # Mean of unique deltas (2, 4, 6) = 4.0
+    if "+4.00p" not in report:
+        _fail(f"all-time mean over deduped entries should be +4.00p: {report[-500:]!r}")
+    _ok("dedupe-at-read: 5 entries -> 3 unique, warning surfaced, mean correct")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Test 5 — filter value-add counterfactual math
 # ─────────────────────────────────────────────────────────────────────
@@ -376,6 +410,7 @@ def main():
     test_2_defensive_accessors()
     test_3_capture_distribution()
     test_4_calibration_trend()
+    test_4b_calibration_dedupe_at_read()
     test_5_filter_value_add()
     test_6_schema_health_anomalies()
     test_7_real_data_smoke()
