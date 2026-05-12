@@ -884,8 +884,21 @@ class AltSystemEngine:
             a = np.array(list(hist_a)[-n:])
             b = np.array(list(hist_b)[-n:])
 
-            with np.errstate(divide="ignore", invalid="ignore"):
-                ratio_hist = np.log(a / b)
+            # Mask-based zero/negative-safe log ratio (2026-05-07 fix).
+            # Previously used `with np.errstate(divide="ignore", invalid=
+            # "ignore"):` to suppress division warnings, but NumPy 2.4
+            # made errstate non-reentrant in a way that occasionally
+            # raised "Cannot enter np.errstate twice" in production
+            # under PyQt's QThread model. The mask-based approach avoids
+            # the suppression entirely — we only compute log on rows
+            # where a > 0 AND b > 0 (the only cases where log(a/b) is
+            # finite), then check finiteness as before.
+            mask = (a > 0) & (b > 0)
+            if not mask.all():
+                # Any zero or negative in the reference window — skip
+                # this pair-group rather than introducing NaN positions.
+                continue
+            ratio_hist = np.log(a / b)
 
             if not np.all(np.isfinite(ratio_hist)):
                 continue

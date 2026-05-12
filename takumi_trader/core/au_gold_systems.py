@@ -182,8 +182,12 @@ class AuGoldSystemEngine:
             try:
                 signals.extend(fn(result))
             except Exception as exc:
+                # exc_info=True captures full traceback so we can pinpoint
+                # which line raised. Previously the error message alone
+                # ("'>' not supported between instances of 'float' and
+                # 'NoneType'") didn't tell us which comparison was at fault.
                 logger.warning("[%s] strategy raised %s: %s",
-                               tag, type(exc).__name__, exc)
+                               tag, type(exc).__name__, exc, exc_info=True)
 
         return signals
 
@@ -391,6 +395,12 @@ class AuGoldSystemEngine:
         if ASIAN_START <= jst_min < ASIAN_END:
             hi = result.xau_high
             lo = result.xau_low
+            # Defensive type/None check (2026-05-07 hardening).
+            # Dataclass default is 0.0 so these SHOULD always be float,
+            # but production saw TypeError on comparisons here that we
+            # couldn't reproduce in isolation. Belt-and-suspenders.
+            if not (isinstance(hi, (int, float)) and isinstance(lo, (int, float))):
+                return signals
             if hi > 0 and lo > 0:
                 if self._au1_asian_high is None or hi > self._au1_asian_high:
                     self._au1_asian_high = hi
@@ -418,6 +428,12 @@ class AuGoldSystemEngine:
         # ── Phase 3: breakout checks ──
         if self._au1_asian_high is None or self._au1_asian_low is None:
             return signals  # didn't observe full Asian session
+        # Defensive type check on state (2026-05-07 hardening). The
+        # state SHOULD be float per Phase 1's assignments, but production
+        # saw TypeError on subsequent comparisons that this guards.
+        if not (isinstance(self._au1_asian_high, (int, float))
+                and isinstance(self._au1_asian_low, (int, float))):
+            return signals
 
         rng_price = self._au1_asian_high - self._au1_asian_low
         rng_pips = rng_price / 0.01  # XAU pip = 0.01
@@ -425,11 +441,12 @@ class AuGoldSystemEngine:
             return signals  # too tight
 
         # Spread guard — avoid trading into news/illiquid ticks
-        if result.xau_spread_points and result.xau_spread_points > 30.0:
+        sp = result.xau_spread_points
+        if isinstance(sp, (int, float)) and sp > 30.0:
             return signals
 
         price = result.xau_price
-        if price <= 0:
+        if not isinstance(price, (int, float)) or price <= 0:
             return signals
 
         sl_pips = rng_pips        # 1× range
