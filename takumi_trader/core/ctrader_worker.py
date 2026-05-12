@@ -163,32 +163,64 @@ class CTraderBridge(QObject):
         if symbol_id is None:
             self._emit_error(pair, f"Symbol {pair} not found")
             return
-        try:
-            from twisted.internet import reactor
-            from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATradeSide
 
-            volume_cents = int(round(volume_lots * 100_000 * 100))
-            trade_side = ProtoOATradeSide.Value("BUY" if direction == "BUY" else "SELL")
+        # Single-retry on the specific Python 3.13+/protobuf transient
+        # init error (2026-05-07 fix). If the first attempt raises with
+        # the matching pattern, wait 100ms and try once more. If the
+        # retry also fails (or it's a different error), emit to the
+        # operator with full traceback.
+        last_exc: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                from twisted.internet import reactor
+                from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATradeSide
 
-            # relativeStopLoss units: 1/100,000 of price
-            # Non-JPY: pips × 10 (pip=0.0001)
-            # JPY:     pips × 1000 (pip=0.01)
-            if "JPY" in pair:
-                sl_pipettes = int(round(sl_pips * 1000)) if sl_pips > 0 else 0
-                tp_pipettes = int(round(tp_pips * 1000)) if tp_pips > 0 else 0
-            else:
-                sl_pipettes = int(round(sl_pips * 10)) if sl_pips > 0 else 0
-                tp_pipettes = int(round(tp_pips * 10)) if tp_pips > 0 else 0
+                volume_cents = int(round(volume_lots * 100_000 * 100))
+                trade_side = ProtoOATradeSide.Value("BUY" if direction == "BUY" else "SELL")
 
-            reactor.callFromThread(
-                self._send_market_order, pair, symbol_id, trade_side, volume_cents,
-                sl_pipettes, tp_pipettes,
-            )
-        except Exception as exc:
-            logger.error("Failed to send order: %s", exc)
-            # Emit error so main_window clears _ct_open_positions and doesn't
-            # leave the pair silently blocked
-            self._emit_error(pair, f"Order send failed: {exc}")
+                # relativeStopLoss units: 1/100,000 of price
+                # Non-JPY: pips × 10 (pip=0.0001)
+                # JPY:     pips × 1000 (pip=0.01)
+                if "JPY" in pair:
+                    sl_pipettes = int(round(sl_pips * 1000)) if sl_pips > 0 else 0
+                    tp_pipettes = int(round(tp_pips * 1000)) if tp_pips > 0 else 0
+                else:
+                    sl_pipettes = int(round(sl_pips * 10)) if sl_pips > 0 else 0
+                    tp_pipettes = int(round(tp_pips * 10)) if tp_pips > 0 else 0
+
+                reactor.callFromThread(
+                    self._send_market_order, pair, symbol_id, trade_side, volume_cents,
+                    sl_pipettes, tp_pipettes,
+                )
+                if attempt == 2:
+                    # Retry recovered — log as warning so the operator
+                    # sees the transient happened, but no popup alert.
+                    logger.warning(
+                        "[cTrader] Order send for %s recovered on retry "
+                        "after transient init error: %s",
+                        pair, last_exc,
+                    )
+                return  # success
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 1 and self._is_transient_init_error(exc):
+                    logger.info(
+                        "[cTrader] Order send for %s hit transient init "
+                        "error; retrying after 100ms",
+                        pair,
+                    )
+                    time.sleep(0.1)
+                    continue
+                # Non-transient error OR retry already exhausted —
+                # emit to operator with full traceback for diagnosis.
+                logger.error(
+                    "Failed to send order (attempt %d/2): %s",
+                    attempt, exc, exc_info=True,
+                )
+                # Emit error so main_window clears _ct_open_positions and
+                # doesn't leave the pair silently blocked.
+                self._emit_error(pair, f"Order send failed: {exc}")
+                return
 
     def close_position(self, position_id: int, volume_lots: float) -> None:
         if not self._is_connected:
@@ -535,6 +567,27 @@ class CTraderBridge(QObject):
         self._symbol_map = new_map
 
     # ── Order sending ─────────────────────────────────────────────
+
+    @staticmethod
+    def _is_transient_init_error(exc: BaseException) -> bool:
+        """Match the specific Python 3.13+/protobuf intermittent error.
+
+        Wording: '__init__() should return None, not 'NoneType''.
+        Surfaced 2026-05-07 — sometimes fires on cTrader order send
+        during the synchronous setup region (protobuf enum lookup, etc.).
+        Intermittent rather than systematic, so a single retry after a
+        brief delay is appropriate. If retry also fails, we emit the
+        original error to the operator.
+
+        Pattern-matches by substring rather than exact-equal so minor
+        version differences in Python's error wording don't break the
+        match.
+        """
+        msg = str(exc)
+        return (
+            "__init__() should return None" in msg
+            and "NoneType" in msg
+        )
 
     def _send_market_order(
         self, pair: str, symbol_id: int, trade_side: int, volume: int,
