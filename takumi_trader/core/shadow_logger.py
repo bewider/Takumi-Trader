@@ -394,15 +394,33 @@ class ShadowLogger:
     The journal file is `data/shadow_trades_<strategy_id>.json`.
 
     Restart safety: on construction, the journal is loaded into
-    memory. log_signal / mark_decision / mark_executed each mutate the
-    in-memory list AND flush to disk before returning. A crash at any
-    point loses at most the partial mutation in flight (atomic file
-    write via tmp+rename means the on-disk file is never corrupt).
+    memory. Mutations update the in-memory list and then either flush
+    immediately (force_flush=True — used by mark_executed for
+    calibration-linkage durability) or are throttled (force_flush=
+    False — used by the hot-path log_signal / log_strength_reject /
+    mark_decision capture path). The throttle window is
+    _FLUSH_THROTTLE_SEC; mutations within the window stay in memory
+    only until the next throttle interval OR force_flush() is called
+    (e.g., on shutdown).
+
+    F.1 (2026-05-14): the throttle was extended to log_signal,
+    log_strength_reject, and mark_decision. Previously these flushed
+    on every call, which became a main-thread blocker as the journal
+    grew (~500ms per 90 MB flush at 104 K records). The hot-path
+    log_strength_reject in particular fires ~15-20 K times/day, so
+    immediate-flush imposed enormous unnecessary I/O. Throttle window
+    of 30s gives at-most-30s recovery loss on crash — observational
+    records, not trading-critical state, so acceptable trade-off.
+    mark_executed retains force_flush=True default for the rare (low
+    frequency) but durability-critical exec_ref linkage.
     """
 
-    # Decision-event flushes are immediate (per Addition 2). Sim updates
-    # written by the bulk simulator can throttle — see Phase C.
-    _SIM_UPDATE_FLUSH_THROTTLE_SEC = 30.0
+    # Throttle window for non-force-flush mutations. Worker's
+    # cycle-end force_flush + closeEvent's explicit force_flush
+    # bound the worst-case durability gap to this many seconds.
+    _FLUSH_THROTTLE_SEC = 30.0
+    # Backward-compat alias (callers may reference the old name)
+    _SIM_UPDATE_FLUSH_THROTTLE_SEC = _FLUSH_THROTTLE_SEC
 
     def __init__(self, strategy_id: str, journal_path: Path) -> None:
         if not strategy_id:
@@ -411,6 +429,8 @@ class ShadowLogger:
         self._journal_path = Path(journal_path)
         self._journal: list[ShadowSignalRecord] = []
         self._next_shadow_id: int = 1
+        self._last_flush: float = 0.0
+        # Backward-compat alias for callers that read the old name
         self._sim_update_last_flush: float = 0.0
         self._load_journal()
 
@@ -491,6 +511,13 @@ class ShadowLogger:
             )
             import os
             os.replace(tmp, self._journal_path)
+            # F.1: stamp the last-flush time inside _flush_atomic so
+            # ALL throttle-aware methods share one source of truth.
+            # The backward-compat alias keeps Phase D worker code
+            # working even though they read the old name.
+            _now = time.time()
+            self._last_flush = _now
+            self._sim_update_last_flush = _now
         except Exception as exc:
             # Flush failure must NEVER take down the trading loop.
             # Log and move on — caller's in-memory record is still
@@ -515,6 +542,7 @@ class ShadowLogger:
         signal_time_str: str = "",
         proposed_lot_size: float = 0.0,
         input_snapshot: dict | None = None,
+        force_flush: bool = False,
     ) -> int:
         """Capture a candidate signal, BEFORE any filter runs.
 
@@ -527,8 +555,12 @@ class ShadowLogger:
         prev_csi, cross_pair_close_prices, M1 history reference.
         Keep small: stored as a JSON blob in the journal record.
 
-        Flushes immediately. Crash after this call = record durable
-        with status=PENDING (caller can investigate orphans on reload).
+        F.1 (2026-05-14): throttled flush by default. The in-memory
+        record is appended immediately; disk flush happens on the
+        next _FLUSH_THROTTLE_SEC boundary OR on force_flush(). Worker
+        cycle-end + closeEvent shutdown bracket the worst-case loss
+        window. Pass force_flush=True if you absolutely need immediate
+        disk durability (rare — Phase B gate sites don't).
         """
         if direction not in ("BUY", "SELL"):
             raise ValueError(f"direction must be BUY or SELL, got {direction!r}")
@@ -559,7 +591,9 @@ class ShadowLogger:
         )
         self._journal.append(rec)
         self._next_shadow_id += 1
-        self._flush_atomic()
+        now = time.time()
+        if force_flush or (now - self._last_flush) >= self._FLUSH_THROTTLE_SEC:
+            self._flush_atomic()
         return rec.shadow_id
 
     # ── Public API: lightweight strength-reject capture ───────────
@@ -582,6 +616,7 @@ class ShadowLogger:
         session: str,
         signal_time: float | None = None,
         signal_time_str: str = "",
+        force_flush: bool = False,
     ) -> int:
         """One-call lightweight capture for strength-gate rejects.
 
@@ -640,7 +675,9 @@ class ShadowLogger:
         )
         self._journal.append(rec)
         self._next_shadow_id += 1
-        self._flush_atomic()
+        now = time.time()
+        if force_flush or (now - self._last_flush) >= self._FLUSH_THROTTLE_SEC:
+            self._flush_atomic()
         return rec.shadow_id
 
     # ── Public API: mark decision (block / skip) ───────────────────
@@ -652,6 +689,7 @@ class ShadowLogger:
         gate: str = "",
         reason: str = "",
         metadata: dict | None = None,
+        force_flush: bool = False,
     ) -> bool:
         """Attach a block / skip outcome to a captured signal.
 
@@ -702,7 +740,9 @@ class ShadowLogger:
             json.dumps(metadata, default=str) if metadata else ""
         )
         rec.last_updated = time.time()
-        self._flush_atomic()
+        now = time.time()
+        if force_flush or (now - self._last_flush) >= self._FLUSH_THROTTLE_SEC:
+            self._flush_atomic()
         return True
 
     # ── Public API: mark executed ──────────────────────────────────

@@ -118,6 +118,7 @@ def test_1_alert_mgr_dedup_happy_path():
             _fail(f"expected GATE_DUPLICATE for GBPJPY, got {marks!r}")
 
         # Reload to ensure persistence
+        log.force_flush()  # F.1: persist throttled mutations before reload
         log2 = ShadowLogger("Sv2", jpath)
         rec = next(r for r in log2.all_records() if r.shadow_id == sid)
 
@@ -171,6 +172,7 @@ def test_2_alert_mgr_nondup_path():
         if marks.get("EURJPY") != GATE_INTERNAL:
             _fail(f"expected GATE_INTERNAL for EURJPY, got {marks!r}")
 
+        log.force_flush()  # F.1: persist throttled mutations before reload
         log2 = ShadowLogger("Sv2", jpath)
         rec = next(r for r in log2.all_records() if r.shadow_id == sid)
 
@@ -217,6 +219,7 @@ def test_3_pair_in_fired_not_remarked():
         if marks:
             _fail(f"orphan-marker should not have touched AUDJPY, got {marks!r}")
 
+        log.force_flush()  # F.1: persist throttled mutations before reload
         log2 = ShadowLogger("Sv2", jpath)
         rec = next(r for r in log2.all_records() if r.shadow_id == sid)
 
@@ -252,6 +255,7 @@ def test_4_empty_intersection_noop():
         if marks:
             _fail(f"expected empty dict, got {marks!r}")
 
+        log.force_flush()  # F.1: persist throttled mutations before reload
         log2 = ShadowLogger("Sv2", jpath)
         if log2.all_records():
             _fail(f"expected zero records on disk, got {len(log2.all_records())}")
@@ -294,6 +298,7 @@ def test_5_defensive_missing_shadow_id():
         if marks:
             _fail(f"expected no marks (no shadow_id to attach to), got {marks!r}")
 
+        log.force_flush()  # F.1: persist throttled mutations before reload
         log2 = ShadowLogger("Sv2", jpath)
         if log2.all_records():
             _fail(f"expected zero records, got {len(log2.all_records())}")

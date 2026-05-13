@@ -58,6 +58,13 @@ def test_capture_then_block_roundtrips():
         if not ok:
             _fail("mark_decision returned False")
 
+        # F.1 (2026-05-14): mark_decision is now throttled by default.
+        # Production uses closeEvent's force_flush() to commit the
+        # last window of mutations before shutdown. Tests that verify
+        # disk durability after mutations must call force_flush()
+        # explicitly to simulate the same persistence point.
+        log.force_flush()
+
         # Simulate process restart by constructing a new logger pointing at same file
         log2 = ShadowLogger("Sv2", jpath)
         recs = log2.all_records()
@@ -119,6 +126,9 @@ def test_orphan_detection():
             proposed_sl_pips=5.0, proposed_tp_pips=10.0,
         )
         # Simulate crash before mark_* by NOT calling them.
+        # F.1: log_signal is throttled; force_flush ensures the PENDING
+        # record is durably on disk for the reload to see.
+        log.force_flush()
         log2 = ShadowLogger("Sv2", jpath)
         if log2.orphan_count() != 1:
             _fail(f"orphan_count: {log2.orphan_count()}")
@@ -142,6 +152,7 @@ def test_monotonic_id_across_restart():
             )
             for _ in range(3)
         ]
+        log.force_flush()  # F.1: persist for reload
         log2 = ShadowLogger("Sv2", jpath)
         next_id = log2.log_signal(
             pair="GBPUSD", direction="SELL",
@@ -165,8 +176,11 @@ def test_atomic_write_no_corruption():
                 proposed_entry=100 + i, proposed_sl_price=99 + i, proposed_tp_price=101 + i,
                 proposed_sl_pips=10, proposed_tp_pips=10,
             )
-            log.mark_decision(sid, STATUS_BLOCKED, GATE_CONVICTION, f"low conv {50-i}")
-            # After every mutation the on-disk file MUST be valid JSON
+            log.mark_decision(sid, STATUS_BLOCKED, GATE_CONVICTION, f"low conv {50-i}",
+                              force_flush=True)
+            # After every mutation the on-disk file MUST be valid JSON.
+            # F.1: force_flush above ensures disk is up to date for the
+            # atomic-write integrity check.
             data = json.loads(jpath.read_text(encoding="utf-8"))
             if not isinstance(data, list) or len(data) != i + 1:
                 _fail(f"corruption at iter {i}: got {type(data).__name__} len={len(data) if isinstance(data, list) else '?'}")
@@ -256,6 +270,7 @@ def test_lightweight_strength_reject():
             spread_points=12.0, m5_atr_pips=8.4, h1_atr_pips=14.1,
             usd_score=5.6, ccy_dispersion=1.42, session="London",
         )
+        log.force_flush()  # F.1: persist throttled record for reload
         log2 = ShadowLogger("Sv2", jpath)
         r = log2.all_records()[0]
         if r.status != STATUS_BLOCKED:

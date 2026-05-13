@@ -7684,6 +7684,17 @@ class MainWindow(QMainWindow):
                 self._shadow_sim_worker.wait(3000)
             except Exception as exc:
                 logger.warning("[SHADOW] sim worker shutdown raised: %s", exc)
+        # F.1 (2026-05-14): explicit final flush of the shadow journal
+        # so the last throttle window's mutations land on disk before
+        # we exit. log_signal / log_strength_reject / mark_decision now
+        # batch-flush every _FLUSH_THROTTLE_SEC (30s); without this
+        # explicit force_flush we'd lose up to 30s of capture data on
+        # every clean shutdown.
+        if getattr(self, "_shadow_logger_sv2", None) is not None:
+            try:
+                self._shadow_logger_sv2.force_flush()
+            except Exception as exc:
+                logger.warning("[SHADOW] final force_flush raised: %s", exc)
         # Close all independent windows (Performance, Backtest, etc.)
         from PyQt6.QtWidgets import QApplication
         for w in QApplication.topLevelWidgets():
