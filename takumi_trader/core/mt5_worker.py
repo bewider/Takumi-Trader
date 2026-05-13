@@ -108,6 +108,15 @@ class MT5Worker(QThread):
         # instrumented in the Sv2 vertical slice; tuned + live engines
         # come during fan-out after Phase F validation.
         self._shadow_logger_sv2 = shadow_logger_sv2
+        # F.7 (2026-05-14): cache the previous M5-close composite_scores
+        # snapshot so input_snapshot can carry composite_scores_prev
+        # alongside composite_scores. ShadowSimulator's lazy feature
+        # recompute reads snap["composite_scores_prev"] for CSI delta
+        # features (feat_dUSD, feat_dEUR, etc.). Without this, the
+        # delta features compute against None -> default to 0.0 and
+        # records permanently miss the CSI rate-of-change signal.
+        # None on first cycle (no prior snapshot to subtract from).
+        self._prev_composite_scores_shadow: dict[str, float] | None = None
 
     def stop(self) -> None:
         self._running = False
@@ -217,14 +226,13 @@ class MT5Worker(QThread):
                             h4_base=_sc("H4", base), h4_quote=_sc("H4", quote),
                             d1_base=_sc("D1", base), d1_quote=_sc("D1", quote),
                             spread_points=_spread_pips(pair),
-                            # TODO(Phase-F): populate from result.m5_atr once
-                            # added to CalculationResult. Currently 0.0 means
-                            # UNMEASURED, NOT zero ATR — Edge Miner queries
-                            # MUST filter records where m5_atr_pips == 0.0
-                            # before doing any ATR-aware analysis. Without
-                            # this filter, zero-imputed values pollute
-                            # volatility-bucketed expectancy comparisons.
-                            m5_atr_pips=0.0,
+                            # F.5 (2026-05-14): now populated from
+                            # result.m5_atr (added to CalculationResult).
+                            # Still 0.0 fallback for pairs where M5
+                            # history wasn't fetched this cycle — Edge
+                            # Miner queries should still treat 0.0 as
+                            # UNMEASURED rather than zero ATR.
+                            m5_atr_pips=float(result.m5_atr.get(pair, 0.0)),
                             h1_atr_pips=float(result.h1_atr.get(pair, 0.0)),
                             usd_score=usd_score,
                             ccy_dispersion=ccy_dispersion,
@@ -268,8 +276,18 @@ class MT5Worker(QThread):
                 # be reproduced from disk-cached MT5 history at sim time.
                 # M1/M15/H1 bars deliberately NOT included (sim re-fetches
                 # via (pair, signal_time)).
+                #
+                # F.7 (2026-05-14): composite_scores_prev added so the
+                # simulator's lazy feature recompute can compute CSI
+                # delta features (feat_dUSD, feat_dEUR, etc.) for
+                # forward records. None on the very first M5-close after
+                # restart — those records will still have zero deltas.
                 input_snapshot = {
                     "composite_scores": dict(composite),
+                    "composite_scores_prev": (
+                        dict(self._prev_composite_scores_shadow)
+                        if self._prev_composite_scores_shadow else None
+                    ),
                     "usd_score": usd_score,
                     "ccy_dispersion": ccy_dispersion,
                     "session": session,
@@ -333,6 +351,14 @@ class MT5Worker(QThread):
                         "[SHADOW] log_signal failed for %s %s: %s",
                         pair, direction, exc,
                     )
+
+        # F.7 (2026-05-14): update the prev-cache for the NEXT M5-close.
+        # Copy because composite may continue mutating in subsequent
+        # cycles; we want the snapshot taken at this M5 close to be
+        # stable. Empty dict instead of None so the next cycle sees a
+        # valid prev (avoiding feat_d* zero-imputation gap on the
+        # very first post-restart cycle's downstream records).
+        self._prev_composite_scores_shadow = dict(composite)
 
         return passes
 
@@ -642,6 +668,16 @@ class MT5Worker(QThread):
             if h1w is not None and len(h1w) >= 15:
                 cached_h1_data[pair] = h1w
         logger.info("H1 ATR cache seeded: %d pairs", len(cached_h1_data))
+        # F.5 (2026-05-14): Cache M5 candle data for ATR computation.
+        # Used by _capture_sv2_shadow's lightweight-reject metadata so
+        # Edge Miner can do volatility-bucketed expectancy analysis.
+        # Seed from warmup so M5 ATR is available immediately.
+        cached_m5_data: dict[str, Any] = {}
+        for pair in ALL_28_PAIRS:
+            m5w = warmup_data.get(pair, {}).get("M5")
+            if m5w is not None and len(m5w) >= 15:
+                cached_m5_data[pair] = m5w
+        logger.info("M5 ATR cache seeded: %d pairs", len(cached_m5_data))
 
         # ── 3. Live loop ─────────────────────────────────────────
         cycle = 0
@@ -722,6 +758,7 @@ class MT5Worker(QThread):
                         cached_results[tf_label] = tf_result
                         if tf_label == "M5":
                             m5_new_candle = True
+                            cached_m5_data = candle_data  # F.5: cache for ATR
                         elif tf_label == "M15":
                             m15_new_candle = True
                         elif tf_label == "H1":
@@ -840,6 +877,32 @@ class MT5Worker(QThread):
                             close = h1c["close"].astype(np.float64)
                             atr_arr = compute_atr(high, low, close, period=14)
                             result.h1_atr[pair] = float(atr_arr[-1])
+                        except Exception:
+                            pass
+
+            # F.5 (2026-05-14): M5 ATR(14) per pair, in pips.
+            # Used by _capture_sv2_shadow to populate the lightweight
+            # strength-reject metadata's `m5_atr_pips` field. Previously
+            # hard-coded to 0.0 ("UNMEASURED placeholder") — Edge Miner
+            # queries had to filter records where m5_atr_pips==0.0 before
+            # any volatility-bucketed analysis. Computing it here means
+            # forward records get real values; existing records remain
+            # at 0.0 (Edge Miner can still filter those).
+            if cached_m5_data:
+                import numpy as np
+                for pair, m5c in cached_m5_data.items():
+                    if m5c is not None and len(m5c) >= 15:
+                        try:
+                            high = m5c["high"].astype(np.float64)
+                            low = m5c["low"].astype(np.float64)
+                            close = m5c["close"].astype(np.float64)
+                            atr_arr = compute_atr(high, low, close, period=14)
+                            atr_price = float(atr_arr[-1])
+                            # Convert to pips (M5 ATR is reported in pips
+                            # per the F.5 field contract, matching
+                            # log_strength_reject's m5_atr_pips param).
+                            pip = 0.01 if "JPY" in pair else 0.0001
+                            result.m5_atr[pair] = atr_price / pip
                         except Exception:
                             pass
 

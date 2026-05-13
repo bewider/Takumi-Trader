@@ -135,6 +135,14 @@ class CalculationResult:
     tick_volumes: dict[str, int] = field(default_factory=dict)    # pair -> M1 tick volume
     m1_bar_time: int = 0  # Unix timestamp of current M1 bar open (for bar-close detection)
     h1_atr: dict[str, float] = field(default_factory=dict)        # pair -> H1 ATR(14) raw price
+    # F.5 (2026-05-14): M5 ATR(14) in pips. Mirrors h1_atr (computed
+    # in the same mt5_worker loop). Populated only on M5-close cycles
+    # for pairs where M5 history was successfully fetched; pairs
+    # without M5 history default to 0.0 (treated as UNMEASURED by
+    # consumers, not zero ATR). Used by _capture_sv2_shadow's
+    # lightweight reject metadata so Edge Miner can do volatility-
+    # bucketed expectancy analysis on rejects without backfilling.
+    m5_atr: dict[str, float] = field(default_factory=dict)        # pair -> M5 ATR(14) in pips
     session_range_pct: dict[str, float] = field(default_factory=dict)  # pair -> consumed %
     htf_regimes: dict = field(default_factory=dict)  # ccy -> {tf: (regime, strength)}
     velocity_data: dict = field(default_factory=dict)  # ccy -> (velocity, is_fast)

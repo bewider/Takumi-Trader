@@ -446,6 +446,32 @@ class FeatureEngine:
 
         Returns empty dict if MT5 unreachable. Maps everything to
         PaperTradeRecord's `feat_` schema.
+
+        ⚠ IMPORTANT — timestamp_utc semantics (F.10, 2026-05-14):
+        ============================================================
+        Despite the `timestamp_utc` parameter, this method fetches
+        **CURRENT** MT5 bars via `copy_rates_from_pos(0, N)` — the
+        `0` is offset-from-newest, so it ALWAYS returns the latest
+        bars regardless of `timestamp_utc`. The timestamp_utc
+        parameter is only used downstream for time-features
+        (session_jst, is_month_end, holiday_label, etc.).
+
+        Practical effect:
+        * Suitable for: live PaperTrader entry stamping (where "now"
+          IS the entry moment, so current bars are the correct bars).
+        * NOT suitable for: historical feature recompute over old
+          signals — the shadow_simulator path uses
+          `extract_feat_dict()` + `compute_for_entry()` instead,
+          which accept historical bars explicitly. See
+          shadow_simulator.py's `_recompute_features` and
+          feature_engine.py's `extract_feat_dict` for the historical
+          path.
+
+        Phase C.3 spent ~30 minutes diagnosing this gap; F.10 lifts
+        the constraint into the docstring to prevent re-discovery.
+        A rename to `compute_features_now` would make the constraint
+        impossible to miss but touches many call sites; documentation
+        is the lower-risk fix.
         """
         try:
             import MetaTrader5 as mt5

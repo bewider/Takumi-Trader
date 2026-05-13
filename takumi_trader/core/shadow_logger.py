@@ -228,6 +228,55 @@ class ShadowSignalRecord:
 
     Schema-extension protocol: see the SCHEMA-EXTENSION PROTOCOL block
     above this dataclass before adding any new field.
+
+    ── Schema-evolution map (F.12 audit 2026-05-14) ──
+    Five field groups across the record's lifecycle. Every field is
+    sparse-omitted at default — round-trip is lossless because load
+    restores defaults for absent fields.
+
+    1. Identity (set by log_signal at signal time, immutable thereafter)
+       shadow_id, strategy_id, signal_time, signal_time_str, pair, direction
+
+    2. Proposed parameters (set by log_signal, immutable)
+       proposed_entry, proposed_sl_price, proposed_tp_price,
+       proposed_sl_pips, proposed_tp_pips, proposed_lot_size
+
+    3. Decision outcome (set by mark_decision / mark_executed)
+       status, block_gate, block_reason, block_metadata_json,
+       exec_lane, exec_ref_json
+       Lifecycle: PENDING (default) -> BLOCKED OR EXECUTED OR FAILED
+
+    4. Input snapshot for lazy feature recompute (set by log_signal)
+       input_snapshot_json
+       Phase C ShadowSimulator reads this to recompute the ~143 feat_*
+       at sim time without blocking the trading loop.
+
+    5. Simulation + worker state (set by ShadowSimulator + ShadowSimWorker)
+       sim_completed                  Phase C   — terminal sim flag
+       sim_exit_time/price/reason     Phase C   — exit details
+       sim_pnl_pips, sim_mae_pips,    Phase C   — outcome metrics
+         sim_mfe_pips, sim_duration_minutes
+       sim_pessimism_applied          Phase C   — stamp for the config used
+       sim_completed_at               Phase C   — wall-clock of sim run
+       sim_failure_reason             Phase D.2 — sparse, only on FAILED
+       transient_retry_count          Phase D.1 — sparse, 0 = never retried
+       calibration_completed          Phase D.3 — sparse, dual-completion flag
+
+       Why dual completion for EXECUTED records (sim_completed AND
+       calibration_completed): the real trade close may lag the
+       sim cycle by hours. Without separate flags, EXECUTED records
+       would leave pending_simulation after first sim, and calibration
+       could never write for trades closing after that point.
+
+    Audit fields: captured_at, last_updated.
+
+    F.12 conclusion (2026-05-14): all three Phase D additions
+    (sim_failure_reason, transient_retry_count, calibration_completed)
+    are correctly sparse-optional. None promoted to required because
+    their meaningful population is conditional (FAILED-only, retry-bumped-
+    only, EXECUTED-and-calibrated-only respectively). The sparse-
+    serialization protocol keeps the journal compact under all three
+    populated patterns.
     """
     # Identity
     shadow_id: int = 0                  # monotonic within this strategy's journal file
@@ -253,12 +302,12 @@ class ShadowSignalRecord:
     exec_lane: str = ""                 # one of VALID_LANES, empty if not EXECUTED
     exec_ref_json: str = ""             # JSON-serialized lane-specific ref dict
 
-    # Input snapshot for lazy feature recompute (Phase C ShadowSimulator
-    # rebuilds the 174 feat_* from this snapshot at sim time, avoiding
-    # blocking the trading loop with network calls at signal time).
+    # Input snapshot for lazy feature recompute (see schema-evolution
+    # map in class docstring §4)
     input_snapshot_json: str = ""
 
-    # Outcome (simulation phase, set by ShadowSimulator in Phase C)
+    # Simulation outcome — see schema-evolution map §5 for the full
+    # set including the Phase D sparse-optional additions.
     sim_completed: bool = False
     sim_exit_time: float = 0.0
     sim_exit_price: float = 0.0
@@ -269,46 +318,19 @@ class ShadowSignalRecord:
     sim_duration_minutes: float = 0.0
     sim_pessimism_applied: str = ""     # e.g. "worst_case_fill+spread+slip_2pt+sl_first"
     sim_completed_at: float = 0.0
-    sim_failure_reason: str = ""        # Added 2026-05-06 (Phase D.2) — populated only
-                                        # when sim_exit_reason == "FAILED". Carries the
-                                        # reason from SimulatedOutcome.sim_failure_reason
-                                        # (no_m1_data, strength_reject_no_snapshot, etc.)
-                                        # OR a transient-giveup marker when the worker
-                                        # exhausts transient_retry_max. Sparse-omitted
-                                        # at default "". Edge Miner uses this to filter
-                                        # FAILED records by failure category. Per the
-                                        # SCHEMA-EXTENSION PROTOCOL.
+    sim_failure_reason: str = ""        # Phase D.2 sparse-optional; see docstring §5
 
     # Features (set by ShadowSimulator after lazy recompute; large
-    # JSON blob — 174 keys at time of writing; flexible for evolution)
+    # JSON blob — 143 keys at time of writing; flexible for evolution)
     features_json: str = ""
 
     # Audit
     captured_at: float = 0.0
     last_updated: float = 0.0
 
-    # ── Phase D worker state ────────────────────────────────────────
-    transient_retry_count: int = 0  # Added 2026-05-06 (Phase D.1) for retry-policy
-                                    # state tracking. Incremented by ShadowSimWorker
-                                    # each time simulate() returns a transient FAILED
-                                    # outcome (no_m1_data, data_too_recent, empty_m1).
-                                    # After config.calibration_warn_after_n retries
-                                    # the worker marks the record permanent-FAILED
-                                    # via write_simulation. Sparse-serialization-safe:
-                                    # default 0 omitted from disk; old records reload
-                                    # with default. Per the SCHEMA-EXTENSION PROTOCOL.
-    calibration_completed: bool = False  # Added 2026-05-06 (Phase D.3) — separate from
-                                         # sim_completed because EXECUTED records need
-                                         # TWO completions: (1) sim_completed=True after
-                                         # the simulator runs, (2) calibration_completed=
-                                         # True after the linked real trade closes AND
-                                         # write_calibration writes the delta. Without
-                                         # this separation, EXECUTED records would
-                                         # disappear from pending_simulation after first
-                                         # sim, and calibration could never write for
-                                         # trades whose real close lags the sim cycle.
-                                         # Sparse-omitted at default False. Per the
-                                         # SCHEMA-EXTENSION PROTOCOL.
+    # Phase D worker state — see schema-evolution map §5
+    transient_retry_count: int = 0       # Phase D.1 sparse-optional
+    calibration_completed: bool = False  # Phase D.3 sparse-optional
 
 
 def _compact_record_dict(rec: ShadowSignalRecord) -> dict[str, Any]:
