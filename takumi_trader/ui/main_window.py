@@ -953,7 +953,16 @@ class MainWindow(QMainWindow):
         self._csi_log = QM4AlertLog(_CSI_LOG_FILE)
         self._csi_sound_file: str = settings.get("csi_sound_file", "")
         self._csi_sound_enabled: bool = settings.get("csi_sound_enabled", True)
-        ocr_enabled = settings.get("ocr_enabled", False)
+        # ── OCR forced OFF (2026-05-14) ──
+        # External QM4 software (which OCR scrapes from) is no longer
+        # available. TAKUMI relies solely on its internal CSI meter
+        # (computed mode) until/unless QM4 software comes back online.
+        # The settings.get("ocr_enabled") value is intentionally IGNORED
+        # — the Settings dialog toggle still exists but is a no-op until
+        # this hardcode is reverted. To re-enable when QM4 returns:
+        # restore `ocr_enabled = settings.get("ocr_enabled", False)`
+        # here AND in _on_settings_changed below.
+        ocr_enabled = False
         self._csi_worker = CsiWorker(self, ocr_mode=ocr_enabled)
         self._csi_worker.scores_ready.connect(self._on_csi_scores)
         self._csi_worker.start()
@@ -5813,7 +5822,10 @@ class MainWindow(QMainWindow):
                 self._toggle_compact()
 
             # ── Apply OCR mode change ──
-            new_ocr = settings.get("ocr_enabled", False)
+            # OCR forced OFF (2026-05-14) — see startup-time comment in
+            # _setup_ui near CsiWorker construction. Settings toggle is
+            # a no-op until external QM4 software comes back online.
+            new_ocr = False
             if hasattr(self, "_csi_worker"):
                 self._csi_worker.set_ocr_mode(new_ocr)
 
