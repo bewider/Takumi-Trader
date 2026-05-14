@@ -114,6 +114,19 @@ _ACTIVE_PERF_FILE = _DATA_DIR / "active_perf_alerts.json"
 _CTRADER_POS_FILE = _DATA_DIR / "ctrader_positions.json"
 _PAPER_TRADES_FILE = _DATA_DIR / "paper_trades.json"
 _CSI_LOG_FILE = _DATA_DIR / "csi_alert_log.json"
+
+# ── System D (QM4) kill switch (added 2026-05-14) ──
+# QM4 inputs (CSI scores) are temporarily unavailable per operator.
+# Setting this False prevents NEW QM4 paper trades from opening but
+# leaves existing QM4 paper-trader state intact:
+#   - update_cycle() still runs on QM4 paper trader to close any
+#     existing open positions via SL/TP monitoring
+#   - QM4 alert engine (_qm4_engine) still receives CSI scores (when
+#     they arrive) and emits alerts to the alerts panel for operator
+#     visibility — only the trade-OPENING branch is gated
+#   - PerformanceDialog still shows historical QM4 stats correctly
+# To re-enable: flip this back to True. No other code changes needed.
+_QM4_TRADING_ENABLED = False
 _TRADES_FILE_SS = _DATA_DIR / "tracked_trades_ss.json"
 _TRADES_FILE_ATR = _DATA_DIR / "tracked_trades_atr.json"
 _TRADES_FILE_QM4 = _DATA_DIR / "tracked_trades_qm4.json"
@@ -5881,7 +5894,14 @@ class MainWindow(QMainWindow):
                     )
 
             # ── System D: QM4 CSI-based paper trades ──
-            # Only trade MTF, MTFC, CUM, PAIR alert types
+            # Only trade MTF, MTFC, CUM, PAIR alert types.
+            # Kill switch (2026-05-14): if _QM4_TRADING_ENABLED is False,
+            # skip the entire trade-opening branch. Alerts are still
+            # logged + shown in the alerts panel (operator visibility);
+            # only new trade openings are suppressed. Existing QM4
+            # positions continue to close normally via update_cycle.
+            if not _QM4_TRADING_ENABLED:
+                continue
             _QM4_TRADE_TYPES = {"MTF", "MTFC", "CUM"}
             from takumi_trader.core.qm4_alerts import QM4PairAlert as _QPA, QM4Alert as _QA
 
