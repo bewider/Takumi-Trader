@@ -679,6 +679,35 @@ class PaperTrader:
             tp_price = entry_price - (tp_pips * pip) - _spread_price
             sl_price = entry_price + (sl_pips * pip) - _spread_price
 
+        # ── Wrong-side SL/TP safety check (added 2026-05-17) ──
+        # When `_spread_price > sl_pips * pip` (i.e., broker spread is
+        # wider than the intended stop distance), the spread-compensation
+        # math above inverts SL/TP to the WRONG side of entry:
+        #   * BUY with SL above entry → any upward tick triggers SL at
+        #     near-break-even, masking what should have been a real loss
+        #   * SELL with SL below entry → symmetric
+        # Audit on 2026-05-17 found 21.6% of Sv2-upgraded trades hit this
+        # path, hiding ~504p of losses. Universal fix here gates every
+        # paper-trader open. When detected, abort the trade entirely —
+        # spread conditions are bad enough that entering is unwise even
+        # with a correctly-placed stop.
+        if direction == "BUY":
+            sl_on_wrong_side = sl_price >= entry_price
+            tp_on_wrong_side = tp_price <= entry_price
+        else:  # SELL
+            sl_on_wrong_side = sl_price <= entry_price
+            tp_on_wrong_side = tp_price >= entry_price
+        if sl_on_wrong_side or tp_on_wrong_side:
+            spread_pips = _spread_price / pip if pip > 0 else 0.0
+            logger.warning(
+                "[PAPER %s] Aborting %s %s entry — spread %.1fp >= "
+                "sl_pips %.1fp would invert SL/TP to wrong side of entry "
+                "(entry=%.5f sl=%.5f tp=%.5f). Returning None.",
+                entry_type or "?", direction, pair, spread_pips,
+                sl_pips, entry_price, sl_price, tp_price,
+            )
+            return None
+
         trade = self._tracker.open_trade(
             pair=pair,
             direction=direction,
