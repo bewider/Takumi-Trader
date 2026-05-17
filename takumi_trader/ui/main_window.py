@@ -127,6 +127,41 @@ _CSI_LOG_FILE = _DATA_DIR / "csi_alert_log.json"
 #   - PerformanceDialog still shows historical QM4 stats correctly
 # To re-enable: flip this back to True. No other code changes needed.
 _QM4_TRADING_ENABLED = False
+
+# ── cTrader non-retryable error codes (added 2026-05-14) ──
+# Server-side refusals where retrying within seconds is wasteful and
+# produces alert cascades. When the order-error handler sees one of
+# these codes, it SKIPS clearing the pair's position lock — so the
+# strategy can't immediately re-fire on the next cycle. Position lock
+# releases naturally when (a) the paper trade closes, or (b) the next
+# legitimate signal cycle for that pair triggers (M5 close + fresh
+# entry conditions).
+#
+# Codes intentionally left out: timeouts, auth-races, network glitches
+# — those genuinely benefit from quick retry on the next cycle.
+_CT_NON_RETRYABLE_CODES: tuple[str, ...] = (
+    "CANT_ROUTE_REQUEST",      # cTrader can't route the order (symbol
+                                # disabled, broker routing blocked, etc.)
+    "SYMBOL_NOT_FOUND",         # account doesn't have this symbol
+    "SYMBOL_NOT_ENABLED",       # symbol present but trading disabled
+    "MARKET_CLOSED",            # session closed for this symbol
+    "INVALID_VOLUME",           # lot size rejected by broker
+    "BLOCKED_PAYLOAD_TYPE",     # rate limited (also handled upstream
+                                # in ctrader_worker; defensive)
+    "ORDER_BLOCKED",            # broker-level risk control
+)
+
+
+def _ct_is_non_retryable_error(error: str) -> bool:
+    """Classify a cTrader error message as non-retryable (server-refusal).
+
+    Substring match — error strings arrive in multiple shapes:
+      * "CANT_ROUTE_REQUEST: Cannot route request" (generic handler)
+      * "Order rejected: CANT_ROUTE_REQUEST: ..." (order-callback path)
+    Returns True iff one of _CT_NON_RETRYABLE_CODES appears anywhere
+    in the message.
+    """
+    return any(code in error for code in _CT_NON_RETRYABLE_CODES)
 _TRADES_FILE_SS = _DATA_DIR / "tracked_trades_ss.json"
 _TRADES_FILE_ATR = _DATA_DIR / "tracked_trades_atr.json"
 _TRADES_FILE_QM4 = _DATA_DIR / "tracked_trades_qm4.json"
@@ -7080,11 +7115,27 @@ class MainWindow(QMainWindow):
         logger.info("cTrader position closed: %s pos=%d", pair, position_id)
 
     def _on_ctrader_order_error(self, pair: str, error: str) -> None:
-        """Handle cTrader order error — suppress auth/reconnect noise."""
-        # Clear position tracking so rejected orders can be retried.
+        """Handle cTrader order error — suppress auth/reconnect noise + cascade.
+
+        Cascade protection (2026-05-14):
+          * Non-retryable server errors (CANT_ROUTE_REQUEST, etc.) — DO NOT
+            clear the pair's position lock. Clearing it would let the
+            strategy re-fire next cycle and hit the same server refusal,
+            creating an alert-panel cascade (~1 entry per 3-5 sec).
+          * Retryable errors (timeouts, auth races, etc.) — existing
+            behavior preserved (clear lock so next cycle can retry).
+          * Panel append also dedup'd by (pair, error-code) within 120s
+            mirroring the popup's existing dedup_key cooldown.
+        """
+        non_retryable = _ct_is_non_retryable_error(error)
+
+        # Clear position tracking ONLY for retryable errors.
         # dtc_combo is the only active live tag today; the others are
         # legacy and included so stale keys also clear.
-        if pair and hasattr(self, "_ct_open_positions"):
+        # For non-retryable: lock stays in place. Releases naturally
+        # when the paper trade closes or the next legitimate signal
+        # cycle for this pair triggers (M5 close + fresh entry).
+        if pair and hasattr(self, "_ct_open_positions") and not non_retryable:
             for tag in ("sv2", "ss", "atr", "qm4", "dtc_combo"):
                 self._ct_open_positions.discard(f"{pair}_{tag}")
 
@@ -7094,6 +7145,29 @@ class MainWindow(QMainWindow):
         if any(n in error for n in _noise):
             logger.warning("cTrader connection issue (auto-retry): %s", error[:100])
             return
+
+        # ── Panel-side dedupe (2026-05-14) ──
+        # Mirrors the popup's `cooldown=120` semantic but applied to the
+        # TREND ALERTS appendleft path. Without this, a non-retryable
+        # error that fires repeatedly via a strategy loop would spam the
+        # panel with duplicate entries even though the popup is silent.
+        # Key shape: "{pair}:{first-token-of-error}" — first token is
+        # typically the error code (e.g., "CANT_ROUTE_REQUEST") for
+        # cTrader rejections and the bare message for others.
+        if not hasattr(self, "_ct_last_panel_alert"):
+            self._ct_last_panel_alert: dict[str, float] = {}
+        _err_token = error.split(":", 1)[0].strip()[:40] if ":" in error else error[:40]
+        _panel_key = f"{pair or 'generic'}:{_err_token}"
+        _now_ts = time.time()
+        _last_ts = self._ct_last_panel_alert.get(_panel_key, 0.0)
+        if _now_ts - _last_ts < 120:
+            # Within cooldown — log only, skip panel append + popup.
+            logger.debug(
+                "cTrader order error (panel-deduped within 120s): %s",
+                error[:100],
+            )
+            return
+        self._ct_last_panel_alert[_panel_key] = _now_ts
 
         now_str = datetime.now(_jst()).strftime("%H:%M:%S")
         html = (
